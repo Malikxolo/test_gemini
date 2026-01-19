@@ -64,12 +64,22 @@ async function startSession() {
         websocket.onmessage = (event) => {
             if (event.data instanceof ArrayBuffer) {
                 // Binary PCM16 audio - direct 24kHz from Gemini
-                log('info', `📥 Received binary audio: ${event.data.byteLength} bytes`);
+                // log('debug', `📥 Received binary audio: ${event.data.byteLength} bytes`);
                 playPcmBinary(new Int16Array(event.data));
+            } else if (event.data instanceof Blob) {
+                // Handle Blob if browser defaults to it
+                log('info', `📥 Received Blob: ${event.data.size} bytes - converting...`);
+                const reader = new FileReader();
+                reader.onload = () => {
+                    playPcmBinary(new Int16Array(reader.result));
+                };
+                reader.readAsArrayBuffer(event.data);
             } else if (typeof event.data === 'string') {
                 // JSON control message
                 const message = JSON.parse(event.data);
                 handleServerMessage(message);
+            } else {
+                log('warn', 'Received unknown message type', event.data);
             }
         };
 
@@ -91,13 +101,14 @@ async function startSession() {
 async function startAudioCapture() {
     isRecording = true;
 
-    // Create separate contexts for input (16kHz) and output (24kHz)
+    // Create separate contexts for input (16kHz) and output (24kHz source, system rate context)
     audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    playbackContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    // Use system default sample rate for playback (more robust)
+    playbackContext = new (window.AudioContext || window.webkitAudioContext)();
 
     // Resume playback context (browsers require this after user interaction)
     await playbackContext.resume();
-    log('info', `🔊 Playback context ready (state: ${playbackContext.state})`);
+    log('info', `🔊 Playback context ready (state: ${playbackContext.state}, rate: ${playbackContext.sampleRate}Hz)`);
 
     await audioContext.audioWorklet.addModule('pcm-processor.js');
 
