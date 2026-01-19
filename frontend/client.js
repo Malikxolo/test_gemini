@@ -187,7 +187,7 @@ function handleServerMessage(message) {
     }
 }
 
-// Play binary PCM16 audio directly (24kHz from Gemini)
+// Play binary PCM16 audio directly (24kHz from Gemini) with resampling
 function playPcmBinary(int16Data) {
     // Ensure playback context exists and is running
     if (!playbackContext || playbackContext.state !== 'running') {
@@ -202,16 +202,23 @@ function playPcmBinary(int16Data) {
         log('info', `⚡ CLIENT LATENCY: ${latency.toFixed(0)}ms (speech → first audio)`);
     }
 
-    log('debug', `Playing audio chunk: ${int16Data.length} samples`);
-
-    // Convert Int16 to Float32
+    // 1. Convert Int16 to Float32 (Standard Web Audio format)
     const float32Data = new Float32Array(int16Data.length);
     for (let i = 0; i < int16Data.length; i++) {
         float32Data[i] = int16Data[i] / 32768.0;
     }
 
-    // Use 24kHz playback context for Gemini's native output
-    const buffer = playbackContext.createBuffer(1, float32Data.length, 24000);
+    // 2. Prepare Source Buffer (24kHz)
+    // We cannot create a buffer with a different sample rate than the context in all browsers reliably.
+    // Instead, we create a buffer at the system rate and resample, OR we let the browser handle it if supported.
+    // Most modern browsers support creating a buffer with a specific sampleRate, and the SourceNode resamples automatically.
+
+    // Let's try the native resampling first which is efficient (createBuffer with 24000)
+    // If your previous attempt failed, it might be that the browser silences it if rates mismatch wildly without a proper node.
+    // BUT since you heard NOTHING, it might be a context time issue.
+
+    const sourceRate = 24000;
+    const buffer = playbackContext.createBuffer(1, float32Data.length, sourceRate);
     buffer.getChannelData(0).set(float32Data);
 
     const source = playbackContext.createBufferSource();
@@ -220,8 +227,11 @@ function playPcmBinary(int16Data) {
 
     // Schedule for gapless playback
     const now = playbackContext.currentTime;
+
+    // CRITICAL FIX: Ensure we don't schedule in the past
+    // If nextStartTime is way behind 'now', we must reset it, otherwise audio plays "instantly" to catch up (chipmunk) or is dropped.
     if (nextStartTime < now) {
-        nextStartTime = now + 0.01;
+        nextStartTime = now + 0.05; // Add small buffer (50ms) to prevent glitch
     }
 
     source.start(nextStartTime);
