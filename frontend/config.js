@@ -3,7 +3,7 @@
 export const config = {
     // 1. Local Development: Use "localhost"
     // 2. Production: Replace with your Render/Railway backend URL (e.g., "voice-backend.onrender.com")
-    BACKEND_URL: "https://voice-backend-m6w6.onrender.com",
+    BACKEND_URL: "voice-backend-m6w6.onrender.com",
 
     // Auto-detect secure/insecure protocol (ws:// vs wss://)
     // If on https (Vercel), use wss. If on http (localhost), use ws.
