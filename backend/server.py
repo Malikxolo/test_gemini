@@ -38,17 +38,6 @@ app = FastAPI(
     version="2.1.0"
 )
 
-# Enable CORS for split hosting (Frontend on Vercel, Backend on Render/Railway)
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (or specify your Vercel domain later)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY not found in .env")

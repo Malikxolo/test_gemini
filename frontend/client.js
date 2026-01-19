@@ -1,8 +1,6 @@
 // Gemini Live Voice Agent - Optimized Client
 // Uses binary WebSocket frames for reduced latency
 
-import { config } from './config.js';
-
 const startBtn = document.getElementById('start-btn');
 const stopBtn = document.getElementById('stop-btn');
 const statusIndicator = document.getElementById('status-indicator');
@@ -48,9 +46,7 @@ async function startSession() {
         log('info', 'Starting session...');
         updateStatus(false, 'Connecting...');
 
-        const wsUrl = config.getWebSocketUrl();
-        log('info', `Connecting to: ${wsUrl}`);
-        websocket = new WebSocket(wsUrl);
+        websocket = new WebSocket(`ws://${location.host}/ws`);
         websocket.binaryType = 'arraybuffer'; // Enable binary messages
 
         websocket.onopen = async () => {
