@@ -4,8 +4,7 @@
 .env
 .env.local
 *.key
-.agent
-.agent/
+
 # Ignore Python virtual environment
 vo/
 

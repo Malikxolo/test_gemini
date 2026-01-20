@@ -14,13 +14,13 @@ export const config = {
         // we should probably warn or try to respect the hardcoded value if the user forgot to change it.
         // But generally, for local dev:
         if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-            return `ws://${this.BACKEND_URL}/ws`; // Local development
+            // When running locally, assume backend is at localhost:8000
+            // This works if accessing via http://localhost:8000 (served by backend)
+            // OR if running frontend separately (e.g. Live Server), assuming backend is up on 8000.
+            return `ws://localhost:8000/ws`;
         } else {
             // Production (Vercel)
-            // Replace THIS string with your actual backend URL after deploying the backend
-            // Example: return `wss://your-app-name.onrender.com/ws`;
-
-            // For now, returning a placeholder or the config value
+            // Use the configured BACKEND_URL
             return `${protocol}//${this.BACKEND_URL}/ws`;
         }
     }

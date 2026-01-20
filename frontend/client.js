@@ -17,6 +17,14 @@ let isRecording = false;
 let nextStartTime = 0;
 let scheduledAudioSources = [];
 
+// Audio pre-buffering to fix jumbled first words
+let audioChunkQueue = [];
+let isPlaybackStarted = false;
+const MIN_BUFFER_CHUNKS = 1;  // Reduced from 2 for faster interruption response
+
+// Track Gemini playback state for proactive interruption
+let isGeminiSpeaking = false;
+
 // Latency tracking
 let speechStartTime = null;
 let firstAudioTime = null;
@@ -110,7 +118,6 @@ async function startAudioCapture() {
     audioWorkletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
 
     let chunkCount = 0;
-    let isSpeaking = false;
 
     audioWorkletNode.port.onmessage = (event) => {
         if (!isRecording || websocket.readyState !== WebSocket.OPEN) return;
@@ -118,22 +125,8 @@ async function startAudioCapture() {
         const pcmInt16 = event.data;
         chunkCount++;
 
-        // Detect speech start (simple energy detection)
-        if (!isSpeaking) {
-            let energy = 0;
-            for (let i = 0; i < pcmInt16.length; i++) {
-                energy += Math.abs(pcmInt16[i]);
-            }
-            energy /= pcmInt16.length;
-
-            if (energy > 500) { // Threshold for voice activity
-                isSpeaking = true;
-                speechStartTime = performance.now();
-                log('info', '🎤 Speech detected');
-            }
-        }
-
         // Send as binary frame (more efficient than JSON+base64)
+        // Interruption is handled entirely by Gemini's VAD -> server sends "interrupted" message
         websocket.send(pcmInt16.buffer);
 
         if (chunkCount % 200 === 0) {
@@ -157,6 +150,7 @@ function handleServerMessage(message) {
         log('info', '✓ Turn complete');
         speechStartTime = null;
         firstAudioTime = null;
+        isGeminiSpeaking = false;
         return;
     }
 
@@ -177,6 +171,7 @@ function handleServerMessage(message) {
 }
 
 // Play binary PCM16 audio directly (24kHz from Gemini)
+// With pre-buffering to prevent jumbled first words
 function playPcmBinary(int16Data) {
     // Ensure playback context exists and is running
     if (!playbackContext || playbackContext.state !== 'running') {
@@ -191,8 +186,28 @@ function playPcmBinary(int16Data) {
         log('info', `⚡ CLIENT LATENCY: ${latency.toFixed(0)}ms (speech → first audio)`);
     }
 
-    log('debug', `Playing audio chunk: ${int16Data.length} samples`);
+    // Add chunk to queue
+    audioChunkQueue.push(int16Data);
 
+    // Pre-buffer: Wait for MIN_BUFFER_CHUNKS before starting playback
+    if (!isPlaybackStarted && audioChunkQueue.length < MIN_BUFFER_CHUNKS) {
+        log('debug', `Buffering... (${audioChunkQueue.length}/${MIN_BUFFER_CHUNKS} chunks)`);
+        return;
+    }
+
+    // Start or continue playback
+    isPlaybackStarted = true;
+    isGeminiSpeaking = true;
+
+    // Process all queued chunks
+    while (audioChunkQueue.length > 0) {
+        const chunk = audioChunkQueue.shift();
+        scheduleAudioChunk(chunk);
+    }
+}
+
+// Helper function to schedule a single audio chunk
+function scheduleAudioChunk(int16Data) {
     // Convert Int16 to Float32
     const float32Data = new Float32Array(int16Data.length);
     for (let i = 0; i < int16Data.length; i++) {
@@ -207,10 +222,10 @@ function playPcmBinary(int16Data) {
     source.buffer = buffer;
     source.connect(playbackContext.destination);
 
-    // Schedule for gapless playback
+    // Schedule for gapless playback with reduced initial delay
     const now = playbackContext.currentTime;
     if (nextStartTime < now) {
-        nextStartTime = now + 0.01;
+        nextStartTime = now + 0.002;  // Reduced from 10ms to 2ms
     }
 
     source.start(nextStartTime);
@@ -229,6 +244,12 @@ function stopAudioQueue() {
     });
     scheduledAudioSources = [];
     nextStartTime = 0;
+
+    // Reset pre-buffering and playback state
+    audioChunkQueue = [];
+    isPlaybackStarted = false;
+    isGeminiSpeaking = false;
+
     if (count > 0) {
         log('info', `Cleared ${count} audio buffers`);
     }

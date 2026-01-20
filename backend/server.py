@@ -18,12 +18,16 @@ import json
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
+import pathlib
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import openai
+from rag_tool import RAGTool
 
-load_dotenv()
+# Load env from root directory
+env_path = pathlib.Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # Configure logging
 logging.basicConfig(
@@ -62,6 +66,9 @@ openrouter_client = openai.AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY
 )
+
+# Initialize RAG Tool
+rag_tool = RAGTool()
 
 # Gemini Live API Configuration
 MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
@@ -139,6 +146,7 @@ async def websocket_endpoint(client_ws: WebSocket):
         client = genai.Client(api_key=GOOGLE_API_KEY)
         
         # Define custom web search tool (uses Perplexity instead of Google)
+        # NON_BLOCKING allows Gemini to continue speaking while search runs
         web_search_tool = types.Tool(
             function_declarations=[
                 types.FunctionDeclaration(
@@ -153,34 +161,97 @@ async def websocket_endpoint(client_ws: WebSocket):
                             )
                         },
                         required=["query"]
-                    )
+                    ),
+                    behavior="NON_BLOCKING"  # Async: Gemini continues while search runs
                 )
             ]
         )
         
-        # Configure Live API session (SDK format)
+        # Define RAG search tool
+        # NON_BLOCKING allows Gemini to continue speaking while RAG runs
+        rag_search_tool = types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name="rag_search",
+                    description="Search the internal knowledge base for policies, guidelines, and specific documents. Use this for questions about 'grievance policies', 'company rules', or other internal matters.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "query": types.Schema(
+                                type=types.Type.STRING,
+                                description="The search query to look up in the knowledge base"
+                            )
+                        },
+                        required=["query"]
+                    ),
+                    behavior="NON_BLOCKING"  # Async: Gemini continues while RAG runs
+                )
+            ]
+        )
+        
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
-            system_instruction="""You are a helpful and friendly AI assistant. Respond naturally and conversationally in 1-2 sentences. Be concise.
+            system_instruction="""You are a conversational AI voice assistant. You speak naturally and help users in real-time.
 
-When you need current information (news, weather, sports, stocks, etc.), use the 'web_search' tool.
+## CRITICAL RULE: STOP MEANS SILENCE
 
-CRITICAL INSTRUCTION FOR WEB SEARCHES:
-Before calling the web_search function, you MUST speak a natural filler phrase to keep the conversation flowing. The filler should be 2-3 sentences to cover the search time. Examples:
-- "Accha, yeh toh interesting question hai! Main abhi check karti hoon aapke liye... ek second..."
-- "Hmm, let me look that up for you right now. Just give me a moment to find the latest information..."
-- "Oh that's a great question! I'm searching for the most up-to-date information on that... one moment please..."
-- "Zaroor! Main internet se latest information dhundh rahi hoon aapke liye..."
+When the user says ANYTHING that means "stop talking" - including but not limited to:
+- "stop", "ruko", "bas", "chup", "quiet", "shut up", "okay okay", "wait", "hold on"
+- Or simply starts talking over you / interrupts you
 
-Speak the filler phrase COMPLETELY first, then call web_search. This prevents awkward silence while searching.""",
-            tools=[web_search_tool],  # Custom web search using Perplexity
-            # Context window compression to prevent latency increase over time
-            # When context exceeds trigger_tokens, older content is compressed
+**YOUR RESPONSE: ABSOLUTE SILENCE.**
+- Do NOT say "okay", "theek hai", "main ruk gaya", "alright", "sure" or ANY acknowledgment
+- Do NOT say anything at all
+- Just stop and wait silently
+- The next thing you say should ONLY be in response to their next actual question
+
+This is non-negotiable. A stop command is NOT a conversation turn. It requires ZERO verbal response.
+
+## LANGUAGE RULE
+
+Match the user's language exactly. If they speak Hindi, respond in Hindi. English → English. Hinglish → Hinglish.
+
+## TOOL USAGE
+
+You have two tools:
+- `web_search`: For weather, news, sports, stocks, current events, anything real-time
+- `rag_search`: For internal policies, documents, company knowledge
+
+### CRITICAL RULES:
+
+1. **Call tool ONCE per question** - never call the same tool twice for one user query
+2. **Say a natural filler while waiting** - when you call a tool, say something brief and natural like:
+   - "hmm, ek second, main dekh ke batati hu..."
+   - "achha, ruko zara check karti hu..."
+   - "let me check that for you..."
+   Then STOP speaking and wait for results.
+3. **NEVER make up information** - while waiting for tool results, do NOT guess or speak any data. Only speak filler, nothing else.
+4. **When results arrive, use them** - the tool response will interrupt your filler. Immediately speak the real data from the tool.
+
+### What NOT to do:
+- Do NOT say things like "the weather is around 30 degrees" before getting results - this is hallucination
+- Do NOT continue speaking after the filler - just wait silently for results
+- Do NOT call the tool again if you already called it
+
+### When tool results arrive:
+- Extract 2-3 key points the user needs
+- Speak conversationally, not as a data dump
+- Don't read JSON or raw data verbatim
+
+## RESPONSE LENGTH
+
+- Default: 1-2 sentences
+- Only give longer responses if explicitly asked for details
+- Voice conversation should be quick back-and-forth, not monologues
+""",
+            tools=[web_search_tool, rag_search_tool],  # Web search + RAG search
+            # Context window compression - VERY AGGRESSIVE to prevent latency buildup
+            # Keep minimal context for fastest responses
             context_window_compression=types.ContextWindowCompressionConfig(
                 sliding_window=types.SlidingWindow(
-                    target_tokens=16000  # Keep ~16k tokens, compress older content
+                    target_tokens=4000   # Keep only ~4k tokens (reduced from 8k)
                 ),
-                trigger_tokens=20000  # Start compressing when hitting 20k tokens
+                trigger_tokens=5000      # Start compressing at 5k (reduced from 10k)
             ),
             generation_config=types.GenerationConfig(
                 thinking_config=types.ThinkingConfig(thinking_budget=0),  # Disable reasoning for speed
@@ -254,6 +325,33 @@ Speak the filler phrase COMPLETELY first, then call web_search. This prevents aw
                 nonlocal is_connected, first_response_time, user_speech_start_time
                 audio_chunk_count = 0
                 
+                # Track processed function calls to prevent duplicate execution
+                # Gemini Live API with NON_BLOCKING can send multiple calls for the same query
+                processed_function_call_ids = set()  # Track by ID
+                pending_queries = {}  # Track by query string -> timestamp (to dedupe same queries within a window)
+                QUERY_DEDUPE_WINDOW_SECONDS = 10  # Don't repeat same query within 10 seconds
+                
+                # Helper to run tool in background and send response when done
+                async def execute_tool_in_background(fc, tool_name, tool_func, query):
+                    """Execute tool and send response - runs as background task"""
+                    try:
+                        logger.info(f"🚀 Starting background {tool_name}: '{query}'")
+                        result = await tool_func(query)
+                        
+                        # Send tool response back to Gemini
+                        function_response = types.FunctionResponse(
+                            name=tool_name,
+                            id=fc.id,
+                            response={"result": result},
+                            scheduling="WHEN_IDLE"  # Interrupt filler speech immediately with real data
+                        )
+                        await session.send(input=types.LiveClientToolResponse(
+                            function_responses=[function_response]
+                        ))
+                        logger.info(f"📨 Sent {tool_name} response to Gemini (background task complete)")
+                    except Exception as e:
+                        logger.error(f"❌ Background {tool_name} error: {e}")
+                
                 try:
                     while is_connected:
                         turn = session.receive()
@@ -261,27 +359,62 @@ Speak the filler phrase COMPLETELY first, then call web_search. This prevents aw
                             if not is_connected:
                                 break
                             
-                            # Handle function calls (web_search)
+                            # Handle function calls - spawn background task, don't await!
                             if response.tool_call:
                                 for fc in response.tool_call.function_calls:
+                                    # Skip if we've already processed this exact function call ID
+                                    if fc.id in processed_function_call_ids:
+                                        logger.debug(f"⏭️ Skipping duplicate function call ID: {fc.name} (id: {fc.id})")
+                                        continue
+                                    
+                                    # Mark ID as processed
+                                    processed_function_call_ids.add(fc.id)
+                                    
                                     if fc.name == "web_search":
                                         query = fc.args.get("query", "")
-                                        logger.info(f"🔧 Function call: web_search('{query}')")
                                         
-                                        # Call Perplexity via OpenRouter
-                                        search_result = await search_with_perplexity(query)
+                                        # Check if we've already searched this query recently (dedupe by content)
+                                        query_key = f"web_search:{query.lower().strip()}"
+                                        current_time = time.time()
+                                        if query_key in pending_queries:
+                                            elapsed = current_time - pending_queries[query_key]
+                                            if elapsed < QUERY_DEDUPE_WINDOW_SECONDS:
+                                                logger.info(f"⏭️ Skipping duplicate web_search query: '{query}' (already called {elapsed:.1f}s ago)")
+                                                continue
                                         
-                                        # Send tool response back to Gemini
-                                        # Use session.send() with the tool_response message directly
-                                        function_response = types.FunctionResponse(
-                                            name="web_search",
-                                            id=fc.id,
-                                            response={"result": search_result}
+                                        # Mark query as pending
+                                        pending_queries[query_key] = current_time
+                                        
+                                        logger.info(f"🔧 Function call: web_search('{query}') - spawning background task")
+                                        
+                                        # Create background task - DON'T AWAIT, let it run in parallel
+                                        asyncio.create_task(
+                                            execute_tool_in_background(fc, "web_search", search_with_perplexity, query)
                                         )
-                                        await session.send(input=types.LiveClientToolResponse(
-                                            function_responses=[function_response]
-                                        ))
-                                        logger.info("📨 Sent tool response to Gemini")
+                                        # Loop continues immediately - Gemini keeps streaming!
+
+                                    elif fc.name == "rag_search":
+                                        query = fc.args.get("query", "")
+                                        
+                                        # Check if we've already searched this query recently (dedupe by content)
+                                        query_key = f"rag_search:{query.lower().strip()}"
+                                        current_time = time.time()
+                                        if query_key in pending_queries:
+                                            elapsed = current_time - pending_queries[query_key]
+                                            if elapsed < QUERY_DEDUPE_WINDOW_SECONDS:
+                                                logger.info(f"⏭️ Skipping duplicate rag_search query: '{query}' (already called {elapsed:.1f}s ago)")
+                                                continue
+                                        
+                                        # Mark query as pending
+                                        pending_queries[query_key] = current_time
+                                        
+                                        logger.info(f"📚 Function call: rag_search('{query}') - spawning background task")
+                                        
+                                        # Create background task - DON'T AWAIT, let it run in parallel
+                                        asyncio.create_task(
+                                            execute_tool_in_background(fc, "rag_search", rag_tool.execute, query)
+                                        )
+                                        # Loop continues immediately - Gemini keeps streaming!
                             
                             if response.server_content and response.server_content.model_turn:
                                 for part in response.server_content.model_turn.parts:
@@ -311,10 +444,15 @@ Speak the filler phrase COMPLETELY first, then call web_search. This prevents aw
                                 user_speech_start_time = None
                                 audio_chunk_count = 0
                             
-                            # Log token usage to monitor context growth
+                            # Log token usage to monitor context growth (key for latency debugging)
                             if hasattr(response, 'usage_metadata') and response.usage_metadata:
                                 usage = response.usage_metadata
-                                logger.info(f"📊 Tokens: {usage.total_token_count} total")
+                                total = usage.total_token_count
+                                # Warn if tokens are getting high (potential latency issue)
+                                if total > 4000:
+                                    logger.warning(f"⚠️ Tokens: {total} (HIGH - may cause latency)")
+                                else:
+                                    logger.info(f"📊 Tokens: {total} total")
                             
                             # Handle interruption
                             if response.server_content and response.server_content.interrupted:
