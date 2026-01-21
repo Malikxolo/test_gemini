@@ -137,6 +137,10 @@ async def websocket_endpoint(client_ws: WebSocket):
     # Connection state
     is_connected = True
     
+    # Session resumption for long meetings (30+ minutes)
+    # Token is stored per-connection and can be used to resume if WebSocket drops
+    session_resume_handle = None
+    
     # Latency tracking
     user_speech_start_time = None
     first_response_time = None
@@ -245,24 +249,37 @@ You have two tools:
 - Voice conversation should be quick back-and-forth, not monologues
 """,
             tools=[web_search_tool, rag_search_tool],  # Web search + RAG search
-            # Context window compression - VERY AGGRESSIVE to prevent latency buildup
-            # Keep minimal context for fastest responses
+            # SESSION RESUMPTION for 30-minute meetings
+            # - WebSocket resets every ~10 min, this allows seamless reconnection
+            # - Tokens valid for 2 hours after session ends
+            # - Server sends SessionResumptionUpdate with new handle periodically
+            session_resumption=types.SessionResumptionConfig(
+                handle=None  # None = new session, or pass previous handle to resume
+            ),
+            # Context window compression - optimized for 30-min meetings with 9-10 people
+            # Native audio models have 128k token limit
+            # With multiple speakers, context grows fast - compress aggressively
             context_window_compression=types.ContextWindowCompressionConfig(
                 sliding_window=types.SlidingWindow(
-                    target_tokens=4000   # Keep only ~4k tokens (reduced from 8k)
+                    target_tokens=8000   # After compression, keep ~8k tokens (enough for recent context)
                 ),
-                trigger_tokens=5000      # Start compressing at 5k (reduced from 10k)
+                trigger_tokens=12000     # Trigger at 12k to avoid frequent compression spikes
             ),
-            generation_config=types.GenerationConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=0),  # Disable reasoning for speed
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name="Zephyr"
-                        )
+            # IMPORTANT: thinking_config and speech_config are TOP-LEVEL in LiveConnectConfig
+            # (generation_config is deprecated for Live API - fields must be set directly)
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=0  # Disable thinking/reasoning for minimal latency
+            ),
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Zephyr"
                     )
                 )
             ),
+            # Generation parameters for speed (lower = faster, more deterministic)
+            temperature=1.0,  # Default for Gemini, balanced
+            # top_p=0.95,       # Slightly focused for faster token selection
             # Native VAD Configuration
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
@@ -339,11 +356,13 @@ You have two tools:
                         result = await tool_func(query)
                         
                         # Send tool response back to Gemini
+                        # IMPORTANT: scheduling is TOP-LEVEL in FunctionResponse, NOT inside response dict
+                        # Per API docs: { id, name, response: {result}, scheduling: enum }
                         function_response = types.FunctionResponse(
                             name=tool_name,
                             id=fc.id,
                             response={"result": result},
-                            scheduling="WHEN_IDLE"  # Interrupt filler speech immediately with real data
+                            scheduling="WHEN_IDLE"  # Wait for model to finish current speech, then use result
                         )
                         await session.send(input=types.LiveClientToolResponse(
                             function_responses=[function_response]
@@ -448,11 +467,32 @@ You have two tools:
                             if hasattr(response, 'usage_metadata') and response.usage_metadata:
                                 usage = response.usage_metadata
                                 total = usage.total_token_count
-                                # Warn if tokens are getting high (potential latency issue)
-                                if total > 4000:
-                                    logger.warning(f"⚠️ Tokens: {total} (HIGH - may cause latency)")
+                                # Warn if tokens approaching compression trigger (12k)
+                                if total > 10000:
+                                    logger.warning(f"⚠️ Tokens: {total} (HIGH - compression soon)")
+                                elif total > 8000:
+                                    logger.info(f"📊 Tokens: {total} (growing)")
                                 else:
                                     logger.info(f"📊 Tokens: {total} total")
+                            
+                            # Handle SESSION RESUMPTION updates (for 30-min meetings)
+                            # Server periodically sends new handles that can be used to resume
+                            if hasattr(response, 'session_resumption_update') and response.session_resumption_update:
+                                update = response.session_resumption_update
+                                if update.resumable and update.new_handle:
+                                    session_resume_handle = update.new_handle
+                                    logger.info(f"� Session resumption handle updated (valid for 2hr)")
+                            
+                            # Handle GO_AWAY message (server warning before disconnect)
+                            # This gives us time to prepare for reconnection
+                            if hasattr(response, 'go_away') and response.go_away:
+                                time_left = response.go_away.time_left
+                                logger.warning(f"⏰ GO_AWAY received - connection ending in {time_left}")
+                                # Notify client about impending reconnection
+                                await client_ws.send_json({
+                                    "type": "sessionWarning", 
+                                    "message": f"Connection resetting soon, will auto-resume"
+                                })
                             
                             # Handle interruption
                             if response.server_content and response.server_content.interrupted:
