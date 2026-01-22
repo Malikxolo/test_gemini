@@ -6,3 +6,4 @@ google-genai
 openai
 httpx
 aiohttp
+pyaudio
