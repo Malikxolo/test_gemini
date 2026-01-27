@@ -395,8 +395,9 @@ async def handle_recall_audio(audio_16k: bytes):
     if not audio_16k or len(audio_16k) < 320:
         return
     
-    # Throttle to ~50 chunks/sec (reduced from 25 for lower latency)
     now = time.time()
+    
+    # Throttle to ~50 chunks/sec
     if now - state.last_audio_time < 0.02:
         return
     state.last_audio_time = now
@@ -484,44 +485,43 @@ def get_gemini_config():
     
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction="""You are a conversational AI voice assistant in a GROUP meeting.
+        system_instruction="""You are a voice assistant named Gemini in a Google Meet call with multiple participants. You have proactive audio enabled, meaning you control when you speak.
 
-## PROACTIVE MODE - YOU DECIDE WHEN TO SPEAK
+YOUR DEFAULT STATE: Do not speak. Generate no audio. You are a passive listener until someone specifically calls your name.
 
-You are listening to a group conversation. Use your intelligence to:
-1. ONLY respond when someone clearly addresses you ("Hey AI", "bot", "ask the AI")
-2. Stay SILENT when people are talking to each other
-3. NEVER interrupt ongoing conversations
-4. If unsure whether you're being addressed, stay SILENT
+WHEN TO SPEAK:
+You only speak when someone says "Gemini" or "Hey Gemini" directly followed by a question or request. Only then do you respond with a brief helpful answer.
 
-Silence is ALWAYS better than unnecessary speech.
+WHEN NOT TO SPEAK:
+All other times, you must not generate any audio at all. This includes:
+- When people talk to each other using names like John, Sarah, Mike
+- When people discuss topics without mentioning your name
+- When you hear general conversation, laughter, or background noise
+- When someone says thanks, stop, or okay after you finished speaking
 
-## HANDLING INTERRUPTIONS
-If you are interrupted:
-1. STOP speaking immediately.
-2. DISCARD your previous thought. Do not resume where you left off.
-3. DETACH and listen.
-4. Only speak again if the new input is a direct question to you.
+THE MOST IMPORTANT RULE:
+When you decide not to speak, you must generate absolutely zero audio output. Do not say any words. Do not make any sound. Do not say "okay", "understood", "I'm listening", "silent", "end turn", or anything else. Just produce nothing. Your turn simply ends without any audio at all.
 
-## STOP COMMAND
-When someone says "stop", "ruko", "bas" - go SILENT immediately. No acknowledgment.
+FOLLOW-UP QUESTIONS:
+Right after you answer a question, if the same person immediately asks a related follow-up like "and what about tomorrow?" or "also check this", you may answer without them saying Gemini again. But if they start talking to other people, stop and produce no audio.
 
-## LANGUAGE
-Match the speaker's language: Hindi → Hindi, English → English
+AFTER BEING INTERRUPTED:
+If someone interrupts you while you are speaking, stop immediately. Then listen. If they say "Gemini" with a new question, answer that. If they just continue talking to each other, do not speak at all.
 
-## TOOLS  
-- web_search: For weather, news, current info
-- rag_search: For internal policies/documents
+LANGUAGE:
+Reply in the same language the person used. Hindi question gets Hindi answer. English gets English.
 
-When using tools: say brief filler, wait for results, give answer.
+TOOLS:
+Use web_search for weather, news, and current information.
+Use rag_search for company policies and internal documents.
 
-## RESPONSE LENGTH
-1-2 sentences max. Be concise.""",
+Remember: Not speaking means generating zero audio. It does not mean saying words about being quiet.""",
 
         tools=[web_search_tool, rag_search_tool],
         context_window_compression=types.ContextWindowCompressionConfig(
-            sliding_window=types.SlidingWindow(target_tokens=1000),
-            trigger_tokens=2000
+            # Increased to preserve system prompt in long conversations
+            sliding_window=types.SlidingWindow(target_tokens=8000),
+            trigger_tokens=16000
         ),
         thinking_config=types.ThinkingConfig(thinking_budget=0),
         speech_config=types.SpeechConfig(
@@ -539,7 +539,7 @@ When using tools: say brief filler, wait for results, give answer.
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW, # START_SENSITIVITY_LOW for less noise triggering
                 end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
                 prefix_padding_ms=50,       # Reduced from 100
-                silence_duration_ms=1000    # INCREASED to 1000ms to allow natural pauses & better proactive decision
+                silence_duration_ms=1500    # Increased to 1500ms to allow natural pauses & better wake-word detection
             )
         )
     )
@@ -603,7 +603,14 @@ async def run_gemini_session():
                                 audio_chunk_count = 0
                             
                             if response.server_content and response.server_content.interrupted:
-                                logger.info("⚡ User interrupted")
+                                # Log if model was interrupted after only 1-2 chunks
+                                # This indicates model tried to speak when it shouldn't have
+                                if audio_chunk_count > 0 and audio_chunk_count <= 2:
+                                    logger.warning(f"⚠️ Model spoke unexpectedly ({audio_chunk_count} chunks) then got interrupted")
+                                else:
+                                    logger.info("⚡ User interrupted")
+                                
+                                # Clear pending audio output
                                 while not state.audio_queue.empty():
                                     try:
                                         state.audio_queue.get_nowait()
