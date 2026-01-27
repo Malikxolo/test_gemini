@@ -1,489 +1,656 @@
 """
-Gemini Live Audio Streaming Backend
-FastAPI server using google-genai SDK with binary WebSocket for ultra-low latency
+Google Meet Bot with Recall.ai + Gemini Live API
 
-Features:
-- Google GenAI SDK for stable connection management
-- Binary WebSocket for audio (no JSON/base64 overhead)
-- JSON messages for control signals only
-- Native 24kHz output (no resampling)
-- Perplexity Sonar web search via OpenRouter (cost-effective)
+Based on working meet_bot.py reference - uses:
+- Raw audio streaming from Recall.ai (16kHz PCM)
+- Direct to Gemini Live API
+- Audio output via webpage in meeting (not API)
 """
 
 import os
+import sys
 import asyncio
-import logging
-import time
 import json
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
+import time
+import base64
+import logging
 import pathlib
+
+import httpx
+import numpy as np
 from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
+
 from google import genai
 from google.genai import types
 import openai
-from rag_tool import RAGTool
 
-# Load env from root directory
+# Load env
 env_path = pathlib.Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
+load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
+logger = logging.getLogger("meet-bot")
 
-app = FastAPI(
-    title="Gemini Live Audio",
-    description="Real-time bidirectional audio streaming with Gemini Live API",
-    version="2.1.0"
-)
+# Environment variables
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+RECALL_API_KEY = os.getenv("RECALLAI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+PUBLIC_URL = os.getenv("WEBHOOK_BASE_URL", "")
+RAG_API_URL = os.getenv("RAG_API_URL")
+BOT_API_KEY = os.getenv("BOT_API_KEY")
 
-# Enable CORS for split hosting (Frontend on Vercel, Backend on Render/Railway)
-from fastapi.middleware.cors import CORSMiddleware
+MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+
+
+# =============================================================================
+# AUDIO RESAMPLER
+# =============================================================================
+
+class AudioResampler:
+    """Resample between Recall.ai (16kHz) and Gemini (24kHz)."""
+    
+    def __init__(self):
+        self.ratio_24_to_16 = 16000 / 24000
+    
+    def to_16k(self, audio_24k: bytes) -> bytes:
+        """Convert 24kHz PCM16 to 16kHz PCM16."""
+        if not audio_24k or len(audio_24k) < 4:
+            return audio_24k
+        
+        samples = np.frombuffer(audio_24k, dtype=np.int16).astype(np.float32) / 32768.0
+        new_len = int(len(samples) * self.ratio_24_to_16)
+        resampled = np.interp(
+            np.linspace(0, 1, new_len),
+            np.linspace(0, 1, len(samples)),
+            samples
+        )
+        return (resampled * 32768.0).astype(np.int16).tobytes()
+
+
+# =============================================================================
+# RAG SYSTEM
+# =============================================================================
+
+class RAGSystem:
+    def __init__(self):
+        self.rag_url = RAG_API_URL
+        self.api_key = BOT_API_KEY
+        if self.rag_url:
+            logger.info(f"📚 RAG System initialized: {self.rag_url}")
+    
+    async def query(self, question: str, top_k: int = 3) -> str:
+        logger.info(f"📖 RAG query: {question}")
+        
+        if not self.rag_url:
+            return "Knowledge base not configured."
+        
+        payload = {"user_id": "meet-bot", "query_text": question, "n_results": top_k}
+        headers = {"accept": "application/json", "Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(f"{self.rag_url}/query", json=payload, headers=headers, timeout=15.0)
+                if resp.status_code != 200:
+                    return "Sorry, I couldn't retrieve that information."
+                
+                results = resp.json().get("results", [])
+                if not results:
+                    return "No relevant information found."
+                
+                formatted = []
+                for idx, r in enumerate(results, start=1):
+                    source = r.get("metadata", {}).get("source", "Unknown")
+                    text = r.get("document", "").strip()
+                    formatted.append(f"[{idx}] {source}: {text[:200]}...")
+                return "\n\n".join(formatted)
+        except Exception as e:
+            logger.error(f"🔥 RAG query error: {e}")
+            return "An error occurred while searching knowledge base."
+
+
+# =============================================================================
+# WEB SEARCH
+# =============================================================================
+
+async def search_with_perplexity(query: str) -> str:
+    logger.info(f"🔍 Web search: {query}")
+    
+    if not OPENROUTER_API_KEY:
+        return "Web search not configured."
+    
+    try:
+        client = openai.AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="perplexity/sonar",
+                messages=[{"role": "user", "content": f"Search and provide a brief answer in 2-3 sentences: {query}"}],
+                max_tokens=200
+            ),
+            timeout=10.0
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"❌ Web search error: {e}")
+        return f"Search failed: {str(e)}"
+
+
+# =============================================================================
+# RECALL.AI CLIENT
+# =============================================================================
+
+class RecallClient:
+    API = "https://us-west-2.recall.ai/api/v1"
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+    
+    async def create_bot(self, meeting_url: str, bot_name: str, ws_url: str, page_url: str) -> dict:
+        logger.info(f"🤖 Creating bot for: {meeting_url}")
+        
+        payload = {
+            "meeting_url": meeting_url,
+            "bot_name": bot_name,
+            "output_media": {"camera": {"kind": "webpage", "config": {"url": page_url}}},
+            "recording_config": {
+                "audio_mixed_raw": {},
+                "realtime_endpoints": [{"type": "websocket", "url": ws_url, "events": ["audio_mixed_raw.data"]}]
+            }
+        }
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.API}/bot",
+                headers={"Authorization": f"Token {self.api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=30.0
+            )
+            if resp.status_code not in (200, 201):
+                raise Exception(f"Recall error: {resp.status_code} - {resp.text}")
+            return resp.json()
+    
+    async def leave_call(self, bot_id: str):
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{self.API}/bot/{bot_id}/leave_call", headers={"Authorization": f"Token {self.api_key}"}, timeout=10.0)
+
+
+# =============================================================================
+# GLOBAL STATE
+# =============================================================================
+
+class BotState:
+    def __init__(self):
+        self.recall = RecallClient(RECALL_API_KEY)
+        self.rag = RAGSystem()
+        self.resampler = AudioResampler()
+        
+        self.bot_id = None
+        self.gemini_session = None
+        self.running = True
+        self.last_audio_time = 0
+        self.audio_queue = asyncio.Queue()
+        
+        # Deduplication
+        self.processed_call_ids = set()
+        self.pending_queries = {}
+        self.DEDUPE_WINDOW = 10
+
+
+state: BotState = None
+
+
+# =============================================================================
+# FASTAPI APP
+# =============================================================================
+
+app = FastAPI(title="Google Meet Voice AI", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (or specify your Vercel domain later)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY not found in .env")
+CONTROLLER_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Gemini Assistant</title></head>
+<body style="background:#1a1a2e;color:white;display:flex;justify-content:center;align-items:center;height:100vh;font-family:Arial;">
+<div style="text-align:center">
+    <div style="font-size:48px;margin-bottom:20px">🤖</div>
+    <div style="font-size:24px">Gemini Assistant</div>
+    <div style="font-size:12px;margin-top:10px;color:#666">Web Search + Knowledge Base</div>
+    <div id="status" style="margin-top:15px;color:#4ecca3">Connecting...</div>
+</div>
+<script>
+const WS_URL = location.protocol === 'https:' 
+    ? "wss://" + location.host + "/ws/output"
+    : "ws://" + location.host + "/ws/output";
+let ctx, playing = false, queue = [], currentSource = null;
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("OPENROUTER_API_KEY not found in .env")
+async function init() {
+    ctx = new AudioContext({sampleRate: 16000});
+    connect();
+}
 
-# Initialize OpenRouter client for Perplexity
-openrouter_client = openai.AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY
-)
+function connect() {
+    const ws = new WebSocket(WS_URL);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => document.getElementById('status').textContent = '🟢 Active';
+    ws.onmessage = e => {
+        if (e.data.byteLength <= 4) {
+            queue = [];
+            if (currentSource) { try { currentSource.stop(); } catch(err) {} currentSource = null; }
+            playing = false;
+            return;
+        }
+        queue.push(e.data);
+        if (!playing) play();
+    };
+    ws.onclose = () => {
+        document.getElementById('status').textContent = '🔴 Reconnecting...';
+        setTimeout(connect, 2000);
+    };
+}
 
-# Initialize RAG Tool
-rag_tool = RAGTool()
+async function play() {
+    if (!queue.length) { playing = false; currentSource = null; return; }
+    playing = true;
+    const data = queue.shift();
+    const int16 = new Int16Array(data);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+    const buf = ctx.createBuffer(1, float32.length, 16000);
+    buf.getChannelData(0).set(float32);
+    currentSource = ctx.createBufferSource();
+    currentSource.buffer = buf;
+    currentSource.connect(ctx.destination);
+    currentSource.onended = play;
+    currentSource.start();
+}
 
-# Gemini Live API Configuration
-MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+init();
+</script>
+</body>
+</html>
+"""
 
 
-async def search_with_perplexity(query: str) -> str:
-    """
-    Call Perplexity Sonar via OpenRouter for web search.
-    NOTE: Streaming disabled - Gemini Live API requires complete tool responses,
-    so streaming tokens gives no benefit. Non-streaming is actually slightly faster
-    due to less overhead.
-    """
-    logger.info(f"🔍 Perplexity search: {query}")
-    start_time = time.time()
+@app.get("/")
+async def root():
+    return {"status": "running", "bot_id": state.bot_id if state else None}
+
+
+@app.get("/controller", response_class=HTMLResponse)
+async def controller():
+    return CONTROLLER_HTML
+
+
+class JoinRequest(BaseModel):
+    meeting_url: str
+    bot_name: str = "AI Assistant"
+
+
+@app.post("/api/bot/join")
+async def join_meeting(request: JoinRequest):
+    global state
+    
+    if not PUBLIC_URL:
+        return {"error": "WEBHOOK_BASE_URL not configured"}
+    
+    if state is None:
+        state = BotState()
+    
+    ws_url = PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws/recall"
+    page_url = PUBLIC_URL + "/controller"
     
     try:
-        # Non-streaming call - Gemini needs complete response anyway
-        response = await asyncio.wait_for(
-            openrouter_client.chat.completions.create(
-                model="perplexity/sonar",
-                messages=[{
-                    "role": "user",
-                    "content": f"Search the web and provide a brief, factual answer in 2-3 sentences: {query}"
-                }],
-                max_tokens=200  # Reduced for faster response
-            ),
-            timeout=10.0  # 10 second timeout
-        )
+        result = await state.recall.create_bot(request.meeting_url, request.bot_name, ws_url, page_url)
+        state.bot_id = result.get("id")
+        logger.info(f"✅ Bot created: {state.bot_id}")
         
-        result = response.choices[0].message.content
-        total_time = (time.time() - start_time) * 1000
-        logger.info(f"✅ Perplexity complete: {total_time:.0f}ms, {len(result)} chars")
-        logger.info(f"📝 Result: {result[:150]}...")
-        return result
+        # Start Gemini session if not running
+        if state.gemini_session is None:
+            asyncio.create_task(run_gemini_session())
         
-    except asyncio.TimeoutError:
-        elapsed = (time.time() - start_time) * 1000
-        logger.error(f"❌ Perplexity timeout after {elapsed:.0f}ms")
-        return "Search timed out. Please try again."
+        return {"bot_id": state.bot_id, "status": "joining"}
     except Exception as e:
-        elapsed = (time.time() - start_time) * 1000
-        logger.error(f"❌ Perplexity error after {elapsed:.0f}ms: {e}")
-        return f"Search failed: {str(e)}"
+        logger.error(f"❌ Failed to create bot: {e}")
+        return {"error": str(e)}
 
 
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "model": MODEL,
-        "version": "2.0.0"
-    }
+@app.post("/api/bot/{bot_id}/leave")
+async def leave_meeting(bot_id: str):
+    global state
+    if state and state.bot_id == bot_id:
+        await state.recall.leave_call(bot_id)
+        state.running = False
+        return {"status": "left"}
+    return {"error": "Bot not found"}
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(client_ws: WebSocket):
-    """
-    WebSocket endpoint for real-time bidirectional audio streaming.
-    - Binary frames: PCM audio data
-    - Text frames: JSON control messages
-    """
-    await client_ws.accept()
-    logger.info("Client connected")
-    
-    # Connection state
-    is_connected = True
-    
-    # Latency tracking
-    user_speech_start_time = None
-    first_response_time = None
+@app.websocket("/ws/recall")
+async def recall_ws(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("🔗 Recall.ai connected")
     
     try:
-        # Initialize Gemini client
-        client = genai.Client(api_key=GOOGLE_API_KEY)
+        while state and state.running:
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                event = json.loads(msg)
+                
+                if event.get("event") == "audio_mixed_raw.data":
+                    # KEY FIX: correct path is data.data.buffer
+                    audio_b64 = event.get("data", {}).get("data", {}).get("buffer", "")
+                    if audio_b64:
+                        audio_bytes = base64.b64decode(audio_b64)
+                        await handle_recall_audio(audio_bytes)
+                        
+            except asyncio.TimeoutError:
+                continue
+            except json.JSONDecodeError:
+                continue
+    except WebSocketDisconnect:
+        logger.info("Recall.ai disconnected")
+    except Exception as e:
+        logger.error(f"Recall WS error: {e}")
+
+
+@app.websocket("/ws/output")
+async def output_ws(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("🔊 Output connected")
+    
+    try:
+        while state and state.running:
+            try:
+                audio = await asyncio.wait_for(state.audio_queue.get(), timeout=30.0)
+                await websocket.send_bytes(audio)
+            except asyncio.TimeoutError:
+                continue
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"Output WS error: {e}")
+
+
+# =============================================================================
+# AUDIO HANDLERS
+# =============================================================================
+
+async def handle_recall_audio(audio_16k: bytes):
+    global state
+    
+    if not audio_16k or len(audio_16k) < 320:
+        return
+    
+    # Throttle to ~50 chunks/sec (reduced from 25 for lower latency)
+    now = time.time()
+    if now - state.last_audio_time < 0.02:
+        return
+    state.last_audio_time = now
+    
+    if state.gemini_session:
+        try:
+            await state.gemini_session.send_realtime_input(
+                audio={"data": audio_16k, "mime_type": "audio/pcm"}
+            )
+        except Exception as e:
+            err_str = str(e).lower()
+            if "close" not in err_str and "cancel" not in err_str:
+                logger.warning(f"Audio send error: {e}")
+
+
+async def handle_gemini_audio(audio_24k: bytes):
+    global state
+    audio_16k = state.resampler.to_16k(audio_24k)
+    await state.audio_queue.put(audio_16k)
+
+
+async def execute_tool(fc, tool_name: str, query: str):
+    global state
+    
+    try:
+        logger.info(f"🚀 Executing {tool_name}: '{query}'")
         
-        # Define custom web search tool (uses Perplexity instead of Google)
-        # NON_BLOCKING allows Gemini to continue speaking while search runs
-        web_search_tool = types.Tool(
-            function_declarations=[
-                types.FunctionDeclaration(
-                    name="web_search",
-                    description="Search the web for current, real-time information. Use this when you need up-to-date data, news, weather, sports scores, stock prices, or any information that may have changed recently.",
-                    parameters=types.Schema(
-                        type=types.Type.OBJECT,
-                        properties={
-                            "query": types.Schema(
-                                type=types.Type.STRING,
-                                description="The search query to look up on the web"
-                            )
-                        },
-                        required=["query"]
-                    ),
-                    behavior="NON_BLOCKING"  # Async: Gemini continues while search runs
-                )
-            ]
-        )
+        if tool_name == "web_search":
+            result = await search_with_perplexity(query)
+        elif tool_name == "rag_search":
+            result = await state.rag.query(query)
+        else:
+            result = f"Unknown tool: {tool_name}"
         
-        # Define RAG search tool
-        # NON_BLOCKING allows Gemini to continue speaking while RAG runs
-        rag_search_tool = types.Tool(
-            function_declarations=[
-                types.FunctionDeclaration(
-                    name="rag_search",
-                    description="Search the internal knowledge base for policies, guidelines, and specific documents. Use this for questions about 'grievance policies', 'company rules', or other internal matters.",
-                    parameters=types.Schema(
-                        type=types.Type.OBJECT,
-                        properties={
-                            "query": types.Schema(
-                                type=types.Type.STRING,
-                                description="The search query to look up in the knowledge base"
-                            )
-                        },
-                        required=["query"]
-                    ),
-                    behavior="NON_BLOCKING"  # Async: Gemini continues while RAG runs
-                )
-            ]
-        )
+        if state.gemini_session:
+            function_response = types.FunctionResponse(
+                name=tool_name,
+                id=fc.id,
+                response={"result": result},
+                scheduling="WHEN_IDLE"
+            )
+            await state.gemini_session.send(input=types.LiveClientToolResponse(
+                function_responses=[function_response]
+            ))
+            logger.info(f"📨 Sent {tool_name} response")
         
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction="""You are a conversational AI voice assistant. You speak naturally and help users in real-time.
+    except Exception as e:
+        logger.error(f"❌ Tool error: {e}")
 
-## CRITICAL RULE: STOP MEANS SILENCE
 
-When the user says ANYTHING that means "stop talking" - including but not limited to:
-- "stop", "ruko", "bas", "chup", "quiet", "shut up", "okay okay", "wait", "hold on"
-- Or simply starts talking over you / interrupts you
+# =============================================================================
+# GEMINI CONFIG
+# =============================================================================
 
-**YOUR RESPONSE: ABSOLUTE SILENCE.**
-- Do NOT say "okay", "theek hai", "main ruk gaya", "alright", "sure" or ANY acknowledgment
-- Do NOT say anything at all
-- Just stop and wait silently
-- The next thing you say should ONLY be in response to their next actual question
+def get_gemini_config():
+    web_search_tool = types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="web_search",
+                description="Search the web for current, real-time information.",
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={"query": types.Schema(type=types.Type.STRING, description="The search query")},
+                    required=["query"]
+                ),
+                behavior="NON_BLOCKING"
+            )
+        ]
+    )
+    
+    rag_search_tool = types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="rag_search",
+                description="Search the internal knowledge base for policies and documents.",
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={"query": types.Schema(type=types.Type.STRING, description="The search query")},
+                    required=["query"]
+                ),
+                behavior="NON_BLOCKING"
+            )
+        ]
+    )
+    
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction="""You are a conversational AI voice assistant in a GROUP meeting.
 
-This is non-negotiable. A stop command is NOT a conversation turn. It requires ZERO verbal response.
+## PROACTIVE MODE - YOU DECIDE WHEN TO SPEAK
 
-## LANGUAGE RULE
+You are listening to a group conversation. Use your intelligence to:
+1. ONLY respond when someone clearly addresses you ("Hey AI", "bot", "ask the AI")
+2. Stay SILENT when people are talking to each other
+3. NEVER interrupt ongoing conversations
+4. If unsure whether you're being addressed, stay SILENT
 
-Match the user's language exactly. If they speak Hindi, respond in Hindi. English → English. Hinglish → Hinglish.
+Silence is ALWAYS better than unnecessary speech.
 
-## TOOL USAGE
+## HANDLING INTERRUPTIONS
+If you are interrupted:
+1. STOP speaking immediately.
+2. DISCARD your previous thought. Do not resume where you left off.
+3. DETACH and listen.
+4. Only speak again if the new input is a direct question to you.
 
-You have two tools:
-- `web_search`: For weather, news, sports, stocks, current events, anything real-time
-- `rag_search`: For internal policies, documents, company knowledge
+## STOP COMMAND
+When someone says "stop", "ruko", "bas" - go SILENT immediately. No acknowledgment.
 
-### CRITICAL RULES:
+## LANGUAGE
+Match the speaker's language: Hindi → Hindi, English → English
 
-1. **Call tool ONCE per question** - never call the same tool twice for one user query
-2. **Say a natural filler while waiting** - when you call a tool, say something brief and natural like:
-   - "hmm, ek second, main dekh ke batati hu..."
-   - "achha, ruko zara check karti hu..."
-   - "let me check that for you..."
-   Then STOP speaking and wait for results.
-3. **NEVER make up information** - while waiting for tool results, do NOT guess or speak any data. Only speak filler, nothing else.
-4. **When results arrive, use them** - the tool response will interrupt your filler. Immediately speak the real data from the tool.
+## TOOLS  
+- web_search: For weather, news, current info
+- rag_search: For internal policies/documents
 
-### What NOT to do:
-- Do NOT say things like "the weather is around 30 degrees" before getting results - this is hallucination
-- Do NOT continue speaking after the filler - just wait silently for results
-- Do NOT call the tool again if you already called it
-
-### When tool results arrive:
-- Extract 2-3 key points the user needs
-- Speak conversationally, not as a data dump
-- Don't read JSON or raw data verbatim
+When using tools: say brief filler, wait for results, give answer.
 
 ## RESPONSE LENGTH
+1-2 sentences max. Be concise.""",
 
-- Default: 1-2 sentences
-- Only give longer responses if explicitly asked for details
-- Voice conversation should be quick back-and-forth, not monologues
-""",
-            tools=[web_search_tool, rag_search_tool],  # Web search + RAG search
-            # Context window compression - MORE AGGRESSIVE to prevent latency buildup
-            # Trigger earlier and keep less context for faster responses
-            context_window_compression=types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow(
-                    target_tokens=1000   # Aggressive compression: keep only last ~1k tokens
-                ),
-                trigger_tokens=2000     # Trigger early at 2k to keep model "light" and fast
-            ),
-            generation_config=types.GenerationConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=0),  # Disable reasoning for speed
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name="Zephyr"
-                        )
-                    )
-                )
-            ),
-            # Native VAD Configuration
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False,
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                    prefix_padding_ms=100,
-                    silence_duration_ms=200
-                )
+        tools=[web_search_tool, rag_search_tool],
+        context_window_compression=types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow(target_tokens=1000),
+            trigger_tokens=2000
+        ),
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+            )
+        ),
+        # PROACTIVE AUDIO - Model decides when to respond (works with v1alpha)
+        proactivity=types.ProactivityConfig(
+            proactive_audio=True
+        ),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=False,
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW, # START_SENSITIVITY_LOW for less noise triggering
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                prefix_padding_ms=50,       # Reduced from 100
+                silence_duration_ms=1000    # INCREASED to 1000ms to allow natural pauses & better proactive decision
             )
         )
-        
-        # Connect to Gemini Live API using SDK
-        async with client.aio.live.connect(model=MODEL, config=config) as session:
-            logger.info("Connected to Gemini Live API (SDK mode)")
+    )
+
+
+# =============================================================================
+# GEMINI SESSION WITH AUTO-RECONNECT
+# =============================================================================
+
+async def run_gemini_session():
+    global state
+    
+    client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1alpha'})
+    config = get_gemini_config()
+    
+    while state and state.running:
+        try:
+            logger.info("🔌 Connecting to Gemini Live API...")
             
-            # Notify client
-            await client_ws.send_json({"type": "connected", "message": "Connected to Gemini Live"})
-            
-            async def receive_from_client():
-                """Receive audio from client and forward to Gemini"""
-                nonlocal is_connected, user_speech_start_time
-                chunk_count = 0
+            async with client.aio.live.connect(model=MODEL, config=config) as session:
+                logger.info("✅ Connected to Gemini Live API")
+                state.gemini_session = session
                 
-                try:
-                    while is_connected:
-                        message = await client_ws.receive()
-                        
-                        if "bytes" in message:
-                            # Binary PCM16 audio - direct to Gemini
-                            pcm_data = message["bytes"]
-                            chunk_count += 1
-                            
-                            # Track speech start (first audio chunk)
-                            if user_speech_start_time is None:
-                                user_speech_start_time = time.time()
-                                logger.info(f"🎤 User started speaking (chunk #{chunk_count})")
-                            
-                            # Send to Gemini using SDK (audio/pcm format)
-                            await session.send_realtime_input(
-                                audio={"data": pcm_data, "mime_type": "audio/pcm"}
-                            )
-                            
-                        elif "text" in message:
-                            # JSON control message
-                            data = json.loads(message["text"])
-                            if data.get("type") == "end":
-                                is_connected = False
-                                break
-                                
-                except WebSocketDisconnect:
-                    logger.info("Client disconnected")
-                    is_connected = False
-                except Exception as e:
-                    logger.error(f"Error receiving from client: {e}")
-                    is_connected = False
-            
-            async def receive_from_gemini():
-                """Receive audio responses from Gemini and send to client"""
-                nonlocal is_connected, first_response_time, user_speech_start_time
                 audio_chunk_count = 0
                 
-                # Track processed function calls to prevent duplicate execution
-                # Gemini Live API with NON_BLOCKING can send multiple calls for the same query
-                processed_function_call_ids = set()  # Track by ID
-                pending_queries = {}  # Track by query string -> timestamp (to dedupe same queries within a window)
-                QUERY_DEDUPE_WINDOW_SECONDS = 10  # Don't repeat same query within 10 seconds
-                
-                # Helper to run tool in background and send response when done
-                async def execute_tool_in_background(fc, tool_name, tool_func, query):
-                    """Execute tool and send response - runs as background task"""
+                while state.running:
                     try:
-                        logger.info(f"🚀 Starting background {tool_name}: '{query}'")
-                        result = await tool_func(query)
-                        
-                        # Send tool response back to Gemini
-                        function_response = types.FunctionResponse(
-                            name=tool_name,
-                            id=fc.id,
-                            response={"result": result},
-                            scheduling="WHEN_IDLE"  # Interrupt filler speech immediately with real data
-                        )
-                        await session.send(input=types.LiveClientToolResponse(
-                            function_responses=[function_response]
-                        ))
-                        logger.info(f"📨 Sent {tool_name} response to Gemini (background task complete)")
-                    except Exception as e:
-                        logger.error(f"❌ Background {tool_name} error: {e}")
-                
-                try:
-                    while is_connected:
                         turn = session.receive()
                         async for response in turn:
-                            if not is_connected:
+                            if not state.running:
                                 break
                             
-                            # Handle function calls - spawn background task, don't await!
+                            # Handle function calls
                             if response.tool_call:
                                 for fc in response.tool_call.function_calls:
-                                    # Skip if we've already processed this exact function call ID
-                                    if fc.id in processed_function_call_ids:
-                                        logger.debug(f"⏭️ Skipping duplicate function call ID: {fc.name} (id: {fc.id})")
+                                    if fc.id in state.processed_call_ids:
                                         continue
+                                    state.processed_call_ids.add(fc.id)
+                                    query = fc.args.get("query", "")
                                     
-                                    # Mark ID as processed
-                                    processed_function_call_ids.add(fc.id)
+                                    query_key = f"{fc.name}:{query.lower().strip()}"
+                                    current_time = time.time()
+                                    if query_key in state.pending_queries:
+                                        if current_time - state.pending_queries[query_key] < state.DEDUPE_WINDOW:
+                                            continue
+                                    state.pending_queries[query_key] = current_time
                                     
-                                    if fc.name == "web_search":
-                                        query = fc.args.get("query", "")
-                                        
-                                        # Check if we've already searched this query recently (dedupe by content)
-                                        query_key = f"web_search:{query.lower().strip()}"
-                                        current_time = time.time()
-                                        if query_key in pending_queries:
-                                            elapsed = current_time - pending_queries[query_key]
-                                            if elapsed < QUERY_DEDUPE_WINDOW_SECONDS:
-                                                logger.info(f"⏭️ Skipping duplicate web_search query: '{query}' (already called {elapsed:.1f}s ago)")
-                                                continue
-                                        
-                                        # Mark query as pending
-                                        pending_queries[query_key] = current_time
-                                        
-                                        logger.info(f"🔧 Function call: web_search('{query}') - spawning background task")
-                                        
-                                        # Create background task - DON'T AWAIT, let it run in parallel
-                                        asyncio.create_task(
-                                            execute_tool_in_background(fc, "web_search", search_with_perplexity, query)
-                                        )
-                                        # Loop continues immediately - Gemini keeps streaming!
-
-                                    elif fc.name == "rag_search":
-                                        query = fc.args.get("query", "")
-                                        
-                                        # Check if we've already searched this query recently (dedupe by content)
-                                        query_key = f"rag_search:{query.lower().strip()}"
-                                        current_time = time.time()
-                                        if query_key in pending_queries:
-                                            elapsed = current_time - pending_queries[query_key]
-                                            if elapsed < QUERY_DEDUPE_WINDOW_SECONDS:
-                                                logger.info(f"⏭️ Skipping duplicate rag_search query: '{query}' (already called {elapsed:.1f}s ago)")
-                                                continue
-                                        
-                                        # Mark query as pending
-                                        pending_queries[query_key] = current_time
-                                        
-                                        logger.info(f"📚 Function call: rag_search('{query}') - spawning background task")
-                                        
-                                        # Create background task - DON'T AWAIT, let it run in parallel
-                                        asyncio.create_task(
-                                            execute_tool_in_background(fc, "rag_search", rag_tool.execute, query)
-                                        )
-                                        # Loop continues immediately - Gemini keeps streaming!
+                                    asyncio.create_task(execute_tool(fc, fc.name, query))
                             
+                            # Handle audio output
                             if response.server_content and response.server_content.model_turn:
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data and isinstance(part.inline_data.data, bytes):
                                         audio_chunk_count += 1
-                                        
-                                        # Measure latency on first audio chunk
-                                        if first_response_time is None and user_speech_start_time:
-                                            first_response_time = time.time()
-                                            latency_ms = (first_response_time - user_speech_start_time) * 1000
-                                            logger.info(f"⚡ LATENCY: {latency_ms:.0f}ms (speech → first audio)")
-                                        
                                         if audio_chunk_count == 1:
-                                            logger.info("🔊 First audio chunk received")
-                                        
-                                        # Send binary PCM directly (24kHz from Gemini)
-                                        audio_bytes = part.inline_data.data
-                                        logger.info(f"📤 Sending audio chunk {audio_chunk_count}: {len(audio_bytes)} bytes")
-                                        await client_ws.send_bytes(audio_bytes)
+                                            logger.info("🔊 First audio chunk from Gemini")
+                                        await handle_gemini_audio(part.inline_data.data)
                             
-                            # Handle turn complete
                             if response.server_content and response.server_content.turn_complete:
-                                logger.info(f"✓ Turn complete ({audio_chunk_count} audio chunks)")
-                                await client_ws.send_json({"type": "turnComplete"})
-                                # Reset for next turn
-                                first_response_time = None
-                                user_speech_start_time = None
+                                logger.info(f"✓ Turn complete ({audio_chunk_count} chunks)")
                                 audio_chunk_count = 0
                             
-                            # Log token usage to monitor context growth
-                            if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                                usage = response.usage_metadata
-                                logger.info(f"📊 Tokens: {usage.total_token_count} total")
-                            
-                            # Handle interruption
                             if response.server_content and response.server_content.interrupted:
-                                logger.info("⚡ User interrupted - VAD triggered")
-                                await client_ws.send_json({"type": "interrupted"})
-                                first_response_time = None
-                                user_speech_start_time = None
+                                logger.info("⚡ User interrupted")
+                                while not state.audio_queue.empty():
+                                    try:
+                                        state.audio_queue.get_nowait()
+                                    except:
+                                        break
+                                await state.audio_queue.put(b'\x00\x00\x00\x00')
                                 audio_chunk_count = 0
                                 
-                except Exception as e:
-                    logger.error(f"Error receiving from Gemini: {e}")
-                    is_connected = False
-            
-            # Run both tasks concurrently
-            await asyncio.gather(
-                receive_from_client(),
-                receive_from_gemini(),
-                return_exceptions=True
-            )
-    
-    except asyncio.CancelledError:
-        logger.info("Connection cancelled")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        try:
-            await client_ws.send_json({"type": "error", "message": str(e)})
-        except:
-            pass
-    finally:
-        try:
-            await client_ws.close()
-        except:
-            pass
-        logger.info("🔌 Connection closed")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        if "cancel" in err_str:
+                            raise
+                        logger.error(f"Gemini receive error: {e}")
+                        break
+                        
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Gemini connection error: {e}")
+        
+        state.gemini_session = None
+        
+        if state and state.running:
+            logger.info("🔄 Reconnecting to Gemini in 2 seconds...")
+            await asyncio.sleep(2)
 
 
-# Serve frontend
-if os.path.exists("../frontend"):
-    app.mount("/", StaticFiles(directory="../frontend", html=True), name="static")
+# =============================================================================
+# STARTUP
+# =============================================================================
+
+@app.on_event("startup")
+async def startup():
+    global state
+    state = BotState()
+    logger.info("🚀 Google Meet Voice AI Server started")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global state
+    if state:
+        state.running = False
+    logger.info("🔌 Server shutdown")
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

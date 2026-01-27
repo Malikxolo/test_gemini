@@ -7,3 +7,5 @@ openai
 httpx
 aiohttp
 pyaudio
+pydantic
+numpy
