@@ -1,103 +1,108 @@
 ---
-description: Debugging command. Activates DEBUG mode for systematic problem investigation.
+description: Systematic debugging with root cause analysis and multiple fix approaches
 ---
 
-# /debug - Systematic Problem Investigation
+# /debug - Debug Workflow
 
-$ARGUMENTS
+Use this workflow when something isn't working as expected and you need to find and fix the issue.
 
----
-
-## Purpose
-
-This command activates DEBUG mode for systematic investigation of issues, errors, or unexpected behavior.
-
----
-
-## Behavior
-
-When `/debug` is triggered:
-
-1. **Gather information**
-   - Error message
-   - Reproduction steps
-   - Expected vs actual behavior
-   - Recent changes
-
-2. **Form hypotheses**
-   - List possible causes
-   - Order by likelihood
-
-3. **Investigate systematically**
-   - Test each hypothesis
-   - Check logs, data flow
-   - Use elimination method
-
-4. **Fix and prevent**
-   - Apply fix
-   - Explain root cause
-   - Add prevention measures
+## Step 1: Research the Issue
+// turbo
+1. Search internet for known issues or patterns
+2. Check if this is a documented problem
+3. Look for similar issues in the codebase history
 
 ---
 
-## Output Format
+## Step 2: Reproduce the Issue
 
-```markdown
-## 🔍 Debug: [Issue]
-
-### 1. Symptom
-[What's happening]
-
-### 2. Information Gathered
-- Error: `[error message]`
-- File: `[filepath]`
-- Line: [line number]
-
-### 3. Hypotheses
-1. ❓ [Most likely cause]
-2. ❓ [Second possibility]
-3. ❓ [Less likely cause]
-
-### 4. Investigation
-
-**Testing hypothesis 1:**
-[What I checked] → [Result]
-
-**Testing hypothesis 2:**
-[What I checked] → [Result]
-
-### 5. Root Cause
-🎯 **[Explanation of why this happened]**
-
-### 6. Fix
-```[language]
-// Before
-[broken code]
-
-// After
-[fixed code]
-```
-
-### 7. Prevention
-🛡️ [How to prevent this in the future]
-```
+Before debugging:
+1. Understand the exact steps to reproduce
+2. Identify the expected vs actual behavior
+3. Note any error messages or logs
 
 ---
 
-## Examples
+## Step 3: Trace Through System
 
-```
-/debug login not working
-/debug API returns 500
-/debug form doesn't submit
-/debug data not saving
-```
+Follow the request flow:
+1. **Entry point**: Where does the request come in?
+2. **Processing**: What components handle it?
+3. **External calls**: Any API calls (RAG, Perplexity, Gemini)?
+4. **Output**: Where does it fail or produce wrong output?
+
+For this voice bot system:
+- Audio input → WebSocket → Gemini API → Tools → Response → Audio output
 
 ---
 
-## Key Principles
+## Step 4: Identify Root Cause
 
-- **Ask before assuming** - get full error context
-- **Test hypotheses** - don't guess randomly
-- **Explain why** - not just what to fix
-- **Prevent recurrence** - add tests, validation
+**CRITICAL**: Find the ACTUAL cause, not symptoms.
+
+Ask:
+- Why is this happening?
+- What changed that might have caused this?
+- Is this a single issue or systemic problem?
+- What other parts of the system might be affected?
+- **Holistic View**: Are inputs/outputs consistent across the entire pipeline?
+
+---
+
+## Step 5: Present Findings
+
+Report:
+- **Root Cause**: What's actually causing the issue
+- **System Impact**: What parts are affected
+- **Related Issues**: Any connected problems discovered
+
+---
+
+## Step 6: Suggest Fix Approaches
+
+Always present 2-3 approaches:
+
+**Option A: Quick Fix**
+- What: [minimal change to fix the symptom]
+- Pros: Fast, low risk
+- Cons: Might not address root cause, could recur
+- Best for: Time-sensitive situations
+
+**Option B: Proper Fix**
+- What: [addresses root cause properly]
+- Pros: Solves the actual problem
+- Cons: More effort, needs testing
+- Best for: Most situations
+
+**Option C: Architectural Fix** (if applicable)
+- What: [redesign to prevent this class of issues]
+- Pros: Long-term stability
+- Cons: Significant effort
+- Best for: Recurring or systemic issues
+
+**Recommendation**: [Best option for production stability]
+
+---
+
+## Step 7: Implement Chosen Fix
+
+After user approval:
+1. Make the minimal, targeted changes
+2. Add logging if needed for future debugging
+3. Document what was changed and why
+
+---
+
+## Step 8: Verify Fix
+// turbo
+1. Run the full system
+2. Reproduce the original issue - should be fixed
+3. Check for regressions in related features
+4. Verify logs show healthy behavior
+
+---
+
+## Return Conditions
+- Return when issue is fixed and verified
+- Return when blocked on user decision
+- Return if issue requires more investigation

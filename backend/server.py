@@ -485,43 +485,50 @@ def get_gemini_config():
     
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction="""You are a voice assistant named Gemini in a Google Meet call with multiple participants. You have proactive audio enabled, meaning you control when you speak.
+        system_instruction="""You are Gemini, an AI assistant in a Google Meet call with multiple people talking.
 
-YOUR DEFAULT STATE: Do not speak. Generate no audio. You are a passive listener until someone specifically calls your name.
+=== WAKE WORD ACTIVATION ===
 
-WHEN TO SPEAK:
-You only speak when someone says "Gemini" or "Hey Gemini" directly followed by a question or request. Only then do you respond with a brief helpful answer.
+You are ONLY activated when someone says "Gemini" or "Hey Gemini".
 
-WHEN NOT TO SPEAK:
-All other times, you must not generate any audio at all. This includes:
-- When people talk to each other using names like John, Sarah, Mike
-- When people discuss topics without mentioning your name
-- When you hear general conversation, laughter, or background noise
-- When someone says thanks, stop, or okay after you finished speaking
+If you hear "Gemini" + a question -> RESPOND with helpful answer.
+If you DO NOT hear "Gemini" -> DO NOT RESPOND. End your turn immediately.
 
-THE MOST IMPORTANT RULE:
-When you decide not to speak, you must generate absolutely zero audio output. Do not say any words. Do not make any sound. Do not say "okay", "understood", "I'm listening", "silent", "end turn", or anything else. Just produce nothing. Your turn simply ends without any audio at all.
+=== DO NOT GENERATE (IMPORTANT) ===
 
-FOLLOW-UP QUESTIONS:
-Right after you answer a question, if the same person immediately asks a related follow-up like "and what about tomorrow?" or "also check this", you may answer without them saying Gemini again. But if they start talking to other people, stop and produce no audio.
+When you should not respond, you must:
+- Generate ZERO audio output
+- Do NOT say "shhh", "hmm", "okay", "um", or ANY sound
+- Just end your turn with no speech at all
 
-AFTER BEING INTERRUPTED:
-If someone interrupts you while you are speaking, stop immediately. Then listen. If they say "Gemini" with a new question, answer that. If they just continue talking to each other, do not speak at all.
+=== DO NOT RESPOND TO (examples) ===
 
-LANGUAGE:
-Reply in the same language the person used. Hindi question gets Hindi answer. English gets English.
+"What's the weather today?" -> END TURN (no "Gemini")
+"Tell me a joke" -> END TURN (no "Gemini")
+"weather batao" -> END TURN (no "Gemini")
+"How are you?" -> END TURN (no "Gemini")
+People talking to each other -> END TURN
+Background noise or laughter -> END TURN
 
-TOOLS:
-Use web_search for weather, news, and current information.
-Use rag_search for company policies and internal documents.
+=== DO RESPOND TO (examples) ===
 
-Remember: Not speaking means generating zero audio. It does not mean saying words about being quiet.""",
+"Gemini, what's the weather?" -> RESPOND
+"Hey Gemini, tell me a joke" -> RESPOND  
+"Gemini weather batao" -> RESPOND
 
-        tools=[web_search_tool, rag_search_tool],
+=== AFTER INTERRUPTION ===
+
+If interrupted: STOP immediately -> END TURN -> wait for "Gemini" again.
+
+=== LANGUAGE ===
+
+Match the speaker's language. Hindi question = Hindi answer.""",
+
+        # TOOLS DISABLED - they trigger unwanted responses after interruption
+        # tools=[web_search_tool, rag_search_tool],
         context_window_compression=types.ContextWindowCompressionConfig(
-            # Increased to preserve system prompt in long conversations
-            sliding_window=types.SlidingWindow(target_tokens=8000),
-            trigger_tokens=16000
+            sliding_window=types.SlidingWindow(target_tokens=12000),
+            trigger_tokens=24000
         ),
         thinking_config=types.ThinkingConfig(thinking_budget=0),
         speech_config=types.SpeechConfig(
@@ -529,17 +536,19 @@ Remember: Not speaking means generating zero audio. It does not mean saying word
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
             )
         ),
-        # PROACTIVE AUDIO - Model decides when to respond (works with v1alpha)
+        # Input transcription for logging/debugging
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        # Proactive audio - allows model to skip responding when appropriate
         proactivity=types.ProactivityConfig(
             proactive_audio=True
         ),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 disabled=False,
-                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW, # START_SENSITIVITY_LOW for less noise triggering
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                 end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                prefix_padding_ms=50,       # Reduced from 100
-                silence_duration_ms=1500    # Increased to 1500ms to allow natural pauses & better wake-word detection
+                prefix_padding_ms=50,
+                silence_duration_ms=1500
             )
         )
     )
@@ -589,13 +598,19 @@ async def run_gemini_session():
                                     
                                     asyncio.create_task(execute_tool(fc, fc.name, query))
                             
-                            # Handle audio output
+                            # Log input transcription for debugging
+                            if response.server_content and response.server_content.input_transcription:
+                                transcript_text = response.server_content.input_transcription.text or ""
+                                if transcript_text.strip():
+                                    logger.info(f"📝 Input: '{transcript_text}'")
+                            
+                            # Handle audio output - Gemini decides when to respond via proactive_audio
                             if response.server_content and response.server_content.model_turn:
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data and isinstance(part.inline_data.data, bytes):
                                         audio_chunk_count += 1
                                         if audio_chunk_count == 1:
-                                            logger.info("🔊 First audio chunk from Gemini")
+                                            logger.info("🔊 Gemini responding (first audio chunk)")
                                         await handle_gemini_audio(part.inline_data.data)
                             
                             if response.server_content and response.server_content.turn_complete:
@@ -603,12 +618,7 @@ async def run_gemini_session():
                                 audio_chunk_count = 0
                             
                             if response.server_content and response.server_content.interrupted:
-                                # Log if model was interrupted after only 1-2 chunks
-                                # This indicates model tried to speak when it shouldn't have
-                                if audio_chunk_count > 0 and audio_chunk_count <= 2:
-                                    logger.warning(f"⚠️ Model spoke unexpectedly ({audio_chunk_count} chunks) then got interrupted")
-                                else:
-                                    logger.info("⚡ User interrupted")
+                                logger.info("⚡ User interrupted - stopping")
                                 
                                 # Clear pending audio output
                                 while not state.audio_queue.empty():
