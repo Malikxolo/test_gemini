@@ -11,8 +11,8 @@ import os
 import sys
 import asyncio
 import json
+import threading    
 import time
-import threading
 import base64
 import logging
 import pathlib
@@ -203,6 +203,11 @@ class BotState:
         self.processed_call_ids = set()
         self.pending_queries = {}
         self.DEDUPE_WINDOW = 10
+        
+        # Wake word state - controls if bot should output audio
+        self.addressed = False
+        self.last_addressed_time = 0
+        self.FOLLOW_UP_TIMEOUT = 10  # seconds to allow follow-up without wake word
 
 
 state: BotState = None
@@ -486,47 +491,30 @@ def get_gemini_config():
     
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction="""You are Gemini, an AI assistant in a Google Meet call with multiple people talking.
+        system_instruction="""You are Gemini, a voice assistant in a Google Meet call.
 
-=== WAKE WORD ACTIVATION ===
+RULE 1 - WAKE WORD REQUIRED:
+Only respond when you hear "Gemini" or "Hey Gemini" followed by a question.
+If you DO NOT hear "Gemini" in the current utterance, say NOTHING at all.
 
-You are ONLY activated when someone says "Gemini" or "Hey Gemini".
+RULE 2 - NOTHING means NOTHING:
+When you should not respond, generate absolutely zero audio.
+Do not say "okay", "I understand", or any acknowledgment.
+Just end your turn with no sound.
 
-If you hear "Gemini" + a question -> RESPOND with helpful answer.
-If you DO NOT hear "Gemini" -> DO NOT RESPOND. End your turn immediately.
+RULE 3 - AFTER INTERRUPTION:
+If someone interrupts you, stop speaking and return to waiting.
+Wait for "Gemini" + new question before speaking again.
 
-=== DO NOT GENERATE (IMPORTANT) ===
+RULE 4 - LANGUAGE MIRRORING:
+Always respond in the same language the user spoke.
+Never mix languages.
 
-When you should not respond, you must:
-- Generate ZERO audio output
-- Do NOT say "shhh", "hmm", "okay", "um", or ANY sound
-- Just end your turn with no speech at all
+TOOLS:
+Use web_search for web information.
+Use rag_search for company knowledge.""",
 
-=== DO NOT RESPOND TO (examples) ===
-
-"What's the weather today?" -> END TURN (no "Gemini")
-"Tell me a joke" -> END TURN (no "Gemini")
-"weather batao" -> END TURN (no "Gemini")
-"How are you?" -> END TURN (no "Gemini")
-People talking to each other -> END TURN
-Background noise or laughter -> END TURN
-
-=== DO RESPOND TO (examples) ===
-
-"Gemini, what's the weather?" -> RESPOND
-"Hey Gemini, tell me a joke" -> RESPOND  
-"Gemini weather batao" -> RESPOND
-
-=== AFTER INTERRUPTION ===
-
-If interrupted: STOP immediately -> END TURN -> wait for "Gemini" again.
-
-=== LANGUAGE ===
-
-Match the speaker's language. Hindi question = Hindi answer.""",
-
-        # TOOLS DISABLED - they trigger unwanted responses after interruption
-        # tools=[web_search_tool, rag_search_tool],
+        tools=[web_search_tool, rag_search_tool],
         context_window_compression=types.ContextWindowCompressionConfig(
             sliding_window=types.SlidingWindow(target_tokens=12000),
             trigger_tokens=24000
@@ -537,9 +525,9 @@ Match the speaker's language. Hindi question = Hindi answer.""",
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
             )
         ),
-        # Input transcription for logging/debugging
+        # Enable input audio transcription for wake word detection
         input_audio_transcription=types.AudioTranscriptionConfig(),
-        # Proactive audio - allows model to skip responding when appropriate
+        # Proactive audio - let model decide when to respond
         proactivity=types.ProactivityConfig(
             proactive_audio=True
         ),
@@ -599,27 +587,50 @@ async def run_gemini_session():
                                     
                                     asyncio.create_task(execute_tool(fc, fc.name, query))
                             
-                            # Log input transcription for debugging
+                            # Check input transcription for wake word "Gemini"
                             if response.server_content and response.server_content.input_transcription:
                                 transcript_text = response.server_content.input_transcription.text or ""
-                                if transcript_text.strip():
-                                    logger.info(f"📝 Input: '{transcript_text}'")
+                                transcript_lower = transcript_text.lower()
+                                
+                                # Detect wake word
+                                if "gemini" in transcript_lower or "jimini" in transcript_lower or "geminy" in transcript_lower:
+                                    state.addressed = True
+                                    state.last_addressed_time = time.time()
+                                    logger.info(f"🎯 WAKE WORD detected in: '{transcript_text}'")
+                                else:
+                                    # Check if still in follow-up window
+                                    time_since_addressed = time.time() - state.last_addressed_time
+                                    if time_since_addressed > state.FOLLOW_UP_TIMEOUT:
+                                        if state.addressed:
+                                            logger.info(f"⏱️ Follow-up timeout, resetting to LISTENING")
+                                        state.addressed = False
+                                    else:
+                                        logger.debug(f"📝 Transcript (no wake word, in follow-up window): '{transcript_text}'")
                             
-                            # Handle audio output - Gemini decides when to respond via proactive_audio
+                            # Handle audio output - GATED by addressed state
                             if response.server_content and response.server_content.model_turn:
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data and isinstance(part.inline_data.data, bytes):
                                         audio_chunk_count += 1
-                                        if audio_chunk_count == 1:
-                                            logger.info("🔊 Gemini responding (first audio chunk)")
-                                        await handle_gemini_audio(part.inline_data.data)
+                                        
+                                        # Only output audio if bot was addressed
+                                        if state.addressed:
+                                            if audio_chunk_count == 1:
+                                                logger.info("🔊 First audio chunk (addressed=True)")
+                                            await handle_gemini_audio(part.inline_data.data)
+                                        else:
+                                            # Suppress audio - bot wasn't addressed
+                                            if audio_chunk_count == 1:
+                                                logger.info("🔇 Suppressing audio (addressed=False)")
                             
                             if response.server_content and response.server_content.turn_complete:
-                                logger.info(f"✓ Turn complete ({audio_chunk_count} chunks)")
+                                logger.info(f"✓ Turn complete ({audio_chunk_count} chunks, addressed={state.addressed})")
                                 audio_chunk_count = 0
                             
                             if response.server_content and response.server_content.interrupted:
-                                logger.info("⚡ User interrupted - stopping")
+                                # CRITICAL: Reset to LISTENING state on ANY interruption
+                                logger.info(f"⚡ Interrupted - resetting to LISTENING state")
+                                state.addressed = False
                                 
                                 # Clear pending audio output
                                 while not state.audio_queue.empty():
