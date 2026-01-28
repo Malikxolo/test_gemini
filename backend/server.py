@@ -12,6 +12,7 @@ import sys
 import asyncio
 import json
 import time
+import threading
 import base64
 import logging
 import pathlib
@@ -669,5 +670,29 @@ async def shutdown():
     logger.info("🔌 Server shutdown")
 
 
+def run_auto_join(meeting_url: str):
+    """Background thread to auto-join meeting after server startup."""
+    time.sleep(2)  # Wait for uvicorn to start
+    logger.info(f"🤖 Auto-joining meeting: {meeting_url}")
+    try:
+        # Use sync httpx for simple script-like behavior in thread
+        import httpx
+        resp = httpx.post(
+            "http://localhost:8000/api/bot/join",
+            json={"meeting_url": meeting_url, "bot_name": "AI Assistant"},
+            timeout=10.0
+        )
+        logger.info(f"Join response: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        logger.error(f"Failed to auto-join: {e}")
+
+
 if __name__ == "__main__":
+    import sys
+    
+    # Check for command line args
+    if len(sys.argv) > 1:
+        meeting_url = sys.argv[1]
+        threading.Thread(target=run_auto_join, args=(meeting_url,), daemon=True).start()
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
