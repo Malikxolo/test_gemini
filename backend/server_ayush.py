@@ -59,7 +59,7 @@ BOT_NAME = "Gemini"
 BOT_ALIASES = ["Gemini", "Hey Gemini", "AI", "Assistant", "Bot"]
 
 # Activation timing
-ACTIVATION_TIMEOUT_SECONDS = 5  # Short window - just enough for the response to complete
+ACTIVATION_TIMEOUT_SECONDS = 10  # Short window - just enough for the response to complete
 DEACTIVATE_AFTER_TURN = True     # If True, deactivate after each response
 
 # Logging verbosity
@@ -69,7 +69,6 @@ LOG_ALL_TRANSCRIPTS = True       # Log all input transcriptions
 
 # Behavior settings
 REQUIRE_ACTIVATION_FOR_AUDIO = True  # If False, all audio passes through (for testing)
-LAST_RESPONSE_FOLLOWUP_WINDOW = 5
 
 
 # =============================================================================
@@ -227,13 +226,12 @@ class ActivationManager:
         self.last_audio_time: float = 0
         self.current_turn_activated: bool = False
         self.last_bot_response_time: float = None  # Track when bot last responded for follow-up detection
+        self.last_response_topic: str = None  # Track what the bot last talked about
         self._lock = asyncio.Lock()
         
         # Stats for debugging
         self.total_activations: int = 0
         self.total_suppressions: int = 0
-        self.conversation_active: bool = False  # Track if in an active conversation
-        self.is_conversation_stale = lambda: (time.time() - self.last_bot_response_time) > 5 if self.last_bot_response_time else True
         
         logger.info(f"🎯 ActivationManager initialized")
         logger.info(f"   Bot name: {BOT_NAME}")
@@ -603,29 +601,21 @@ async def execute_tool(fc, tool_name: str, args: dict):
     try:
         # Handle activation function - bridge already opened in receive loop
         if tool_name == "activate_response":
-            reason = args.get('reason', '')
-            
-            # Check if this is a follow-up or fresh activation
-            is_followup = state.activation.conversation_active and not state.activation.is_conversation_stale()
-            
-            state.activation.is_activated = True
-            state.activation.activation_time = time.time()
-            
-            if is_followup:
-                # logger.info(f"🔄 FOLLOW-UP: {reason}")
-                pass
-            else:
-                # logger.info(f"🎙️ NEW CONVERSATION: {reason}")
-                state.activation.conversation_active = True
-            
-            # Only spawn task if we have a valid session
-            if is_session_alive():
-                asyncio.create_task(execute_tool(fc, tool_name, args))
-            else:
-                logger.warning("⚠️ Skipping tool execution - session not alive")
+            # Bridge already opened immediately in receive loop (before this task runs)
+            # Just send the confirmation response to Gemini
+            if state.gemini_session:
+                function_response = types.FunctionResponse(
+                    name=tool_name,
+                    id=fc.id,
+                    response={"status": "activated", "message": "Voice channel is now open."}
+                )
+                await state.gemini_session.send(input=types.LiveClientToolResponse(
+                    function_responses=[function_response]
+                ))
+            return
         
         # Handle other tools
-        logger.debug(f"🔧 Executing {tool_name}: {args}")
+        logger.info(f"🔧 Executing {tool_name}: {args}")
         
         if tool_name == "web_search":
             result = await search_with_perplexity(args.get("query", ""))
@@ -635,44 +625,20 @@ async def execute_tool(fc, tool_name: str, args: dict):
             result = f"Unknown tool: {tool_name}"
         
         if state.gemini_session:
-            try:
-                function_response = types.FunctionResponse(
-                    name=tool_name,
-                    id=fc.id,
-                    response={"result": result},
-                    scheduling="WHEN_IDLE"
-                )
-                await asyncio.wait_for(
-                    state.gemini_session.send(input=types.LiveClientToolResponse(
-                        function_responses=[function_response]
-                    )),
-                    timeout=5.0  # Add timeout
-                )
-                logger.debug(f"📨 Sent {tool_name} response")
-            except asyncio.TimeoutError:
-                logger.warning(f"⏰ Tool response timeout for {tool_name}")
-            except Exception as e:
-                # Don't spam logs for known websocket errors during reconnection
-                err_str = str(e).lower()
-                if "1008" in err_str or "policy violation" in err_str or "websocket" in err_str:
-                    logger.debug(f"Session disconnected during {tool_name} response (reconnecting...)")
-                else:
-                    logger.error(f"❌ Failed to send {tool_name} response: {e}")
+            function_response = types.FunctionResponse(
+                name=tool_name,
+                id=fc.id,
+                response={"result": result},
+                scheduling="WHEN_IDLE"
+            )
+            await state.gemini_session.send(input=types.LiveClientToolResponse(
+                function_responses=[function_response]
+            ))
+            logger.info(f"📨 Sent {tool_name} response")
         
     except Exception as e:
-        err_str = str(e).lower()
-        if "1008" not in err_str and "policy violation" not in err_str:
-            logger.error(f"❌ Tool execution error: {e}")
+        logger.error(f"❌ Tool error: {e}")
 
-
-def is_session_alive() -> bool:
-    """Check if Gemini session is alive and ready."""
-    global state
-    if not state or not state.gemini_session:
-        return False
-    
-    # Add any additional checks if needed
-    return True
 
 # =============================================================================
 # GEMINI CONFIG
@@ -706,13 +672,18 @@ DEFAULT TO NOT CALLING THIS FUNCTION unless you're confident they explicitly add
                         "reason": types.Schema(
                             type=types.Type.STRING, 
                             description="Why you're activating - must include how they addressed you by name"
+                        ),
+                        "topic": types.Schema(
+                            type=types.Type.STRING,
+                            description="Brief description of what you're about to respond about (e.g., 'Q3 sales figures', 'weather in Delhi', 'meeting schedule')"
                         )
                     },
-                    required=["reason"]
+                    required=["reason", "topic"]
                 )
             )
         ]
     )
+    
     
     web_search_tool = types.Tool(
         function_declarations=[
@@ -833,17 +804,29 @@ You MAY treat a follow-up as directed to you WITHOUT re-saying your name
 ONLY IF ALL of the following are true:
 
 - You were explicitly activated in the immediately previous turn
-- The follow-up occurs shortly after your response (same conversational flow)
-- The follow-up clearly refers to your last answer
+- The follow-up occurs shortly after your response (within ~15 seconds)
+- The follow-up CLEARLY and DIRECTLY refers to your last answer or the same topic
+- The follow-up uses contextual references like "that", "it", "what about", "and", "also"
 - No other person is addressed by name
+- The follow-up is ASKING something, not just discussing
 
-Examples (after you already responded):
-- “What about last quarter?”
-- “Can you repeat that?”
-- “And for last year?”
+CRITICAL: The follow-up must be ABOUT the same topic you just discussed.
+
+Examples that SHOULD activate (after you just answered about Q3 sales):
+- "What about Q4?"
+- "Can you repeat that number?"
+- "And for last year?"
+- "What about the other regions?"
+
+Examples that should NOT activate (even within 15 seconds of your response):
+- "John, what do you think about that?" (addressed to John)
+- "Yeah, that makes sense" (statement, not a question for you)
+- "Should we move to the next topic?" (question for the group)
+- "Hey, did you see the email?" (unrelated new topic)
+- "I agree with what Gemini said" (talking ABOUT you, not TO you)
 
 This does NOT allow open conversation.
-If there is any ambiguity → remain silent.
+When in doubt about relevance → remain silent.
 
 ================================================================================
 WHEN YOU MUST NOT ACTIVATE
@@ -990,7 +973,9 @@ async def run_gemini_session():
                                     # This prevents race condition where audio arrives before task runs
                                     if tool_name == "activate_response":
                                         state.activation.is_activated = True
-                                        logger.info(f"🎙️ Bridge OPENED: {args.get('reason', '')}")
+                                        topic = args.get('topic', 'unknown topic')
+                                        state.activation.last_response_topic = topic
+                                        logger.info(f"🎙️ Bridge OPENED: {args.get('reason', '')} | Topic: {topic}")
                                     
                                     asyncio.create_task(execute_tool(fc, tool_name, args))
                             
@@ -999,16 +984,6 @@ async def run_gemini_session():
                                 transcript_text = response.server_content.input_transcription.text or ""
                                 if transcript_text.strip() and LOG_ALL_TRANSCRIPTS:
                                     logger.info(f"� Heard: '{transcript_text}'")
-                                
-                                # Auto-activate for follow-up questions (no wake word needed)
-                                if transcript_text.strip() and state.activation.last_bot_response_time:
-                                    current_time = time.time()
-                                    time_since_last_response = current_time - state.activation.last_bot_response_time
-                                    # If user speaks within 15 seconds of bot's last response, auto-activate
-                                    if time_since_last_response < LAST_RESPONSE_FOLLOWUP_WINDOW:
-                                        if not state.activation.is_activated:
-                                            state.activation.is_activated = True
-                                            logger.info(f"🎙️ Auto-activated for follow-up (within {time_since_last_response:.1f}s of last response)")
                             
                             # Handle audio output - GATED by activation (like old working code)
                             if response.server_content and response.server_content.model_turn:
