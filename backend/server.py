@@ -1,20 +1,18 @@
 """
 Google Meet Bot with Recall.ai + Gemini Live API
 
-INTELLIGENT ACTIVATION SYSTEM:
-- Gemini listens to all audio continuously
-- Gemini decides WHETHER it's being addressed using its understanding
-- Gemini calls `activate_response` function when it wants to respond
-- Audio output is ONLY allowed after activation
-- Auto-deactivates after response or timeout
+Based on working meet_bot.py reference - uses:
+- Raw audio streaming from Recall.ai (16kHz PCM)
+- Direct to Gemini Live API
+- Audio output via webpage in meeting (not API)
 """
 
 import os
 import sys
 import asyncio
 import json
+import threading    
 import time
-import threading
 import base64
 import logging
 import pathlib
@@ -41,32 +39,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("meet-bot")
 
-
-# =============================================================================
-# ⚙️ GLOBAL CONFIGURATION - MODIFY THESE VALUES AS NEEDED
-# =============================================================================
-
-# Bot identity - Gemini uses this to know when it's being addressed
-BOT_NAME = "Gemini"  # Primary name the bot responds to
-BOT_ALIASES = ["Gemini", "Hey Gemini", "AI", "Assistant", "Bot"]  # Alternative names (for prompt context)
-
-# Activation timing
-ACTIVATION_TIMEOUT_SECONDS = 10  # Short window - just enough for the response to complete
-DEACTIVATE_AFTER_TURN = True  # If True, deactivate after each response (require fresh activation per utterance)
-
-# Logging verbosity
-LOG_ACTIVATION_EVENTS = True  # Log activation/deactivation events
-LOG_SUPPRESSED_AUDIO = False  # Log when audio is suppressed (verbose)
-LOG_ALL_TRANSCRIPTS = True  # Log all input transcriptions
-
-# Behavior settings
-REQUIRE_ACTIVATION_FOR_AUDIO = True  # If False, all audio passes through (for testing)
-
-
-# =============================================================================
-# ENVIRONMENT VARIABLES
-# =============================================================================
-
+# Environment variables
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 RECALL_API_KEY = os.getenv("RECALLAI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -75,6 +48,27 @@ RAG_API_URL = os.getenv("RAG_API_URL")
 BOT_API_KEY = os.getenv("BOT_API_KEY")
 
 MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+
+
+# =============================================================================
+# ⚙️ GLOBAL CONFIGURATION
+# =============================================================================
+
+# Bot identity - Gemini uses this to know when it's being addressed
+BOT_NAME = "Gemini"
+BOT_ALIASES = ["Gemini", "Hey Gemini", "AI", "Assistant", "Bot"]
+
+# Activation timing
+ACTIVATION_TIMEOUT_SECONDS = 10  # Short window - just enough for the response to complete
+DEACTIVATE_AFTER_TURN = True     # If True, deactivate after each response
+
+# Logging verbosity
+LOG_ACTIVATION_EVENTS = True     # Log activation/deactivation events
+LOG_SUPPRESSED_AUDIO = False     # Log when audio is suppressed (verbose)
+LOG_ALL_TRANSCRIPTS = True       # Log all input transcriptions
+
+# Behavior settings
+REQUIRE_ACTIVATION_FOR_AUDIO = True  # If False, all audio passes through (for testing)
 
 
 # =============================================================================
@@ -230,7 +224,7 @@ class ActivationManager:
         self.is_activated: bool = False
         self.activation_time: float = 0
         self.last_audio_time: float = 0
-        self.current_turn_activated: bool = False  # Track if current turn was activated
+        self.current_turn_activated: bool = False
         self._lock = asyncio.Lock()
         
         # Stats for debugging
@@ -268,13 +262,11 @@ class ActivationManager:
         """Called when a response turn completes."""
         async with self._lock:
             if DEACTIVATE_AFTER_TURN:
-                # Deactivate immediately - require fresh activation for next utterance
                 if self.is_activated and LOG_ACTIVATION_EVENTS:
-                    logger.info(f"😴 Turn complete - DEACTIVATING (fresh activation required for next question)")
+                    logger.info(f"😴 Turn complete - DEACTIVATING (fresh activation required)")
                 self.is_activated = False
                 self.current_turn_activated = False
             else:
-                # Legacy behavior - stay activated
                 self.current_turn_activated = False
                 if LOG_ACTIVATION_EVENTS:
                     remaining = self.get_time_remaining()
@@ -284,7 +276,6 @@ class ActivationManager:
         """Record that audio was output."""
         async with self._lock:
             self.last_audio_time = time.time()
-            # Don't extend activation - we want fresh evaluation per utterance
     
     async def should_allow_audio(self) -> bool:
         """Check if audio output should be allowed."""
@@ -336,7 +327,7 @@ class BotState:
         self.recall = RecallClient(RECALL_API_KEY)
         self.rag = RAGSystem()
         self.resampler = AudioResampler()
-        self.activation = ActivationManager()
+        self.activation = ActivationManager()  # Use proper activation manager
         
         self.bot_id = None
         self.gemini_session = None
@@ -357,7 +348,7 @@ state: BotState = None
 # FASTAPI APP
 # =============================================================================
 
-app = FastAPI(title="Google Meet Voice AI", version="4.0.0")
+app = FastAPI(title="Google Meet Voice AI", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -373,12 +364,10 @@ CONTROLLER_HTML = """
 <head><title>Gemini Assistant</title></head>
 <body style="background:#1a1a2e;color:white;display:flex;justify-content:center;align-items:center;height:100vh;font-family:Arial;">
 <div style="text-align:center">
-    <div id="icon" style="font-size:48px;margin-bottom:20px">🤖</div>
+    <div style="font-size:48px;margin-bottom:20px">🤖</div>
     <div style="font-size:24px">Gemini Assistant</div>
-    <div style="font-size:12px;margin-top:10px;color:#666">Intelligent Voice Activation</div>
+    <div style="font-size:12px;margin-top:10px;color:#666">Web Search + Knowledge Base</div>
     <div id="status" style="margin-top:15px;color:#4ecca3">Connecting...</div>
-    <div id="activation" style="margin-top:10px;font-size:14px;color:#888">State: Unknown</div>
-    <div id="stats" style="margin-top:5px;font-size:11px;color:#555"></div>
 </div>
 <script>
 const WS_URL = location.protocol === 'https:' 
@@ -389,34 +378,12 @@ let ctx, playing = false, queue = [], currentSource = null;
 async function init() {
     ctx = new AudioContext({sampleRate: 16000});
     connect();
-    setInterval(updateStatus, 1000);
-}
-
-async function updateStatus() {
-    try {
-        const resp = await fetch('/api/activation');
-        const data = await resp.json();
-        const el = document.getElementById('activation');
-        const icon = document.getElementById('icon');
-        const stats = document.getElementById('stats');
-        
-        if (data.is_activated) {
-            el.textContent = `🟢 LISTENING (${Math.round(data.time_remaining)}s)`;
-            el.style.color = '#4ecca3';
-            icon.textContent = '🎤';
-        } else {
-            el.textContent = '😴 IDLE - say "' + data.bot_name + '" to activate';
-            el.style.color = '#888';
-            icon.textContent = '🤖';
-        }
-        stats.textContent = `Activations: ${data.total_activations} | Suppressed: ${data.total_suppressions}`;
-    } catch (e) {}
 }
 
 function connect() {
     const ws = new WebSocket(WS_URL);
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => document.getElementById('status').textContent = '🟢 Connected';
+    ws.onopen = () => document.getElementById('status').textContent = '🟢 Active';
     ws.onmessage = e => {
         if (e.data.byteLength <= 4) {
             queue = [];
@@ -519,6 +486,7 @@ async def join_meeting(request: JoinRequest):
         state.bot_id = result.get("id")
         logger.info(f"✅ Bot created: {state.bot_id}")
         
+        # Start Gemini session if not running
         if state.gemini_session is None:
             asyncio.create_task(run_gemini_session())
         
@@ -550,6 +518,7 @@ async def recall_ws(websocket: WebSocket):
                 event = json.loads(msg)
                 
                 if event.get("event") == "audio_mixed_raw.data":
+                    # KEY FIX: correct path is data.data.buffer
                     audio_b64 = event.get("data", {}).get("data", {}).get("buffer", "")
                     if audio_b64:
                         audio_bytes = base64.b64decode(audio_b64)
@@ -588,13 +557,14 @@ async def output_ws(websocket: WebSocket):
 # =============================================================================
 
 async def handle_recall_audio(audio_16k: bytes):
-    """Forward audio from Recall.ai to Gemini."""
     global state
     
     if not audio_16k or len(audio_16k) < 320:
         return
     
     now = time.time()
+    
+    # Throttle to ~50 chunks/sec
     if now - state.last_audio_time < 0.02:
         return
     state.last_audio_time = now
@@ -617,13 +587,13 @@ async def handle_gemini_audio(audio_24k: bytes):
     """
     global state
     
-    # Check if we should allow audio
+    # Check if we should allow audio - THIS IS THE CRITICAL GATE
     should_allow = await state.activation.should_allow_audio()
     
     if not should_allow:
         if LOG_SUPPRESSED_AUDIO:
             logger.debug("🔇 Audio suppressed (not activated)")
-        return
+        return  # Audio never reaches the queue
     
     # Activated - allow audio through
     audio_16k = state.resampler.to_16k(audio_24k)
@@ -631,21 +601,15 @@ async def handle_gemini_audio(audio_24k: bytes):
     await state.activation.record_audio_output()
 
 
-async def handle_activation_function(reason: str):
-    """Called when Gemini's activate_response function is triggered."""
-    global state
-    await state.activation.activate(reason=reason)
-
-
 async def execute_tool(fc, tool_name: str, args: dict):
     """Execute tool calls from Gemini."""
     global state
     
     try:
-        # Handle activation function
+        # Handle activation function - MUST complete before returning
         if tool_name == "activate_response":
             reason = args.get("reason", "user addressed me")
-            await handle_activation_function(reason)
+            await state.activation.activate(reason=reason)
             
             # Send acknowledgment back to Gemini
             if state.gemini_session:
@@ -660,7 +624,7 @@ async def execute_tool(fc, tool_name: str, args: dict):
             return
         
         # Handle other tools
-        logger.info(f"🚀 Executing {tool_name}: {args}")
+        logger.info(f"🔧 Executing {tool_name}: {args}")
         
         if tool_name == "web_search":
             result = await search_with_perplexity(args.get("query", ""))
@@ -703,10 +667,11 @@ REQUIRED CONDITIONS (ALL must be true):
 3. It's clear they want YOU to respond (not another person in the meeting)
 
 DO NOT CALL when:
+- Someone says ANY OTHER NAME (they're talking to another human like Anmol, John, Rahul)
 - Questions without your name (probably asking another human)
 - People talking to each other
 - General questions to the room
-- Third-person mentions ("I asked {BOT_NAME}...")
+- Third-person mentions ("I asked {BOT_NAME}...", "the AI thinks...")
 - You're uncertain who they're addressing
 
 DEFAULT TO NOT CALLING THIS FUNCTION unless you're confident they explicitly addressed you.""",
@@ -728,7 +693,7 @@ DEFAULT TO NOT CALLING THIS FUNCTION unless you're confident they explicitly add
         function_declarations=[
             types.FunctionDeclaration(
                 name="web_search",
-                description="Search the web for current, real-time information.",
+                description="Searches the internet for current, real-time information. Use when user asks about recent events, news, weather, or any data that changes frequently.",
                 parameters=types.Schema(
                     type=types.Type.OBJECT,
                     properties={"query": types.Schema(type=types.Type.STRING, description="The search query")},
@@ -743,7 +708,7 @@ DEFAULT TO NOT CALLING THIS FUNCTION unless you're confident they explicitly add
         function_declarations=[
             types.FunctionDeclaration(
                 name="rag_search",
-                description="Search the internal knowledge base for policies and documents.",
+                description="Searches the internal company knowledge base. Use when user asks about company policies, internal documents, procedures, or organizational information.",
                 parameters=types.Schema(
                     type=types.Type.OBJECT,
                     properties={"query": types.Schema(type=types.Type.STRING, description="The search query")},
@@ -755,66 +720,169 @@ DEFAULT TO NOT CALLING THIS FUNCTION unless you're confident they explicitly add
     )
     
     # Build the system instruction with bot identity
-    system_instruction = f"""You are {BOT_NAME}, an AI voice assistant participating in a Google Meet call with multiple people.
+    system_instruction = f"""You are {BOT_NAME}, an AI voice assistant participating in a live Google Meet call with multiple people.
 
-=== CRITICAL: YOU MUST EVALUATE EVERY SINGLE UTTERANCE INDEPENDENTLY ===
+================================================================================
+CRITICAL OPERATING PRINCIPLE
+================================================================================
 
-You can hear EVERYTHING in the meeting. Most of what you hear is NOT directed at you.
+SILENCE IS YOUR DEFAULT STATE.
 
-**For EACH new thing you hear, you must decide: "Is this person talking TO me?"**
+You can hear EVERYTHING in the meeting.
+Most utterances are NOT directed at you.
 
-**BEFORE you speak, you MUST call the `activate_response` function.** If you don't call it, your audio is blocked.
+For EACH utterance you hear, you must independently decide:
 
-=== DECISION CRITERIA ===
+“Is this person clearly talking TO ME right now?”
 
-✅ ACTIVATE only when ALL of these are true:
-- The person EXPLICITLY addresses you by name ("{BOT_NAME}", "Hey {BOT_NAME}", "AI", etc.)
-- AND they are asking YOU a question or making a request TO you
+If the answer is not a confident YES → remain completely silent.
 
-❌ DO NOT ACTIVATE when:
-- People are talking to EACH OTHER (even if asking questions)
-- Someone asks a question but doesn't say your name (they're probably asking another human)
-- Background conversation, even if it sounds like a question
-- Someone mentions you in third person ("I asked {BOT_NAME}...", "Maybe {BOT_NAME} knows...")
-- General questions to the room that aren't specifically directed at you
-- You're unsure → DEFAULT TO SILENCE
+You are NOT allowed to speak unless you FIRST call the function:
+activate_response(reason=...)
 
-=== CRITICAL: NO ASSUMPTIONS ===
+If you do not call this function, your audio output is blocked.
+Do not acknowledge, react, or respond in any way without activation.
 
-- Do NOT assume a question is for you just because you answered a previous question
-- Do NOT assume follow-up questions are for you unless they say your name again
-- Each utterance is independent - evaluate it fresh
-- When in doubt, STAY SILENT
+================================================================================
+HOW YOU MAY BE ADDRESSED
+================================================================================
 
-=== EXAMPLES ===
+You may be referred to as:
+- {BOT_NAME}
+- Gemini
+- AI
+- assistant
+- bot
+- “the AI” / “the assistant”
 
-✅ ACTIVATE:
-- "Hey {BOT_NAME}, what time is it?" → activate(reason="explicitly addressed me by name")
-- "{BOT_NAME}, search for news about AI" → activate(reason="said my name and gave command")
-- "Gemini, can you help?" → activate(reason="addressed me directly")
+These references may appear:
+- In English, Hindi, Hinglish, or any other language
+- Translated or paraphrased
+- Informally or colloquially
 
-❌ STAY SILENT (do not activate):
-- "What time is it?" (no name - probably asking another person)
-- "Can someone tell me about the accounts?" (asking the room, not you specifically)
-- "जरा बताना कि इस क्वार्टर के अकाउंट्स कितना है" (asking someone else - no mention of you)
-- "How do you know that?" (talking to another human)
-- "John, what do you think?" (clearly addressing John)
-- "I wonder if the AI could help with that..." (talking ABOUT you, not TO you)
+You must reason about INTENT, not exact wording.
 
-=== RESPONSE GUIDELINES (only after activation) ===
+================================================================================
+ACTIVATION RULES
+================================================================================
 
-1. Call `activate_response` with clear reason
-2. Keep responses concise (this is voice)
-3. Match the speaker's language (Hindi → Hindi, English → English)
+You may call activate_response ONLY when ALL applicable conditions are satisfied.
 
-=== IF INTERRUPTED ===
+-------------------------------------------------------------------------------
+A) EXPLICIT ADDRESS (STRONG SIGNAL)
+-------------------------------------------------------------------------------
 
-Stop immediately. Wait for explicit mention of your name before responding again."""
+Activate when ALL are true:
+- The speaker directly addresses you by name or alias
+- AND they ask YOU a question or give YOU a command
+- AND it is clear they expect YOU (not a human) to respond
+
+Examples:
+- “Hey {BOT_NAME}, what time is it?”
+- “Gemini, look this up”
+- “AI, can you explain this?”
+
+-------------------------------------------------------------------------------
+B) IMPLICIT AI VOCATIVE (ALLOWED, BUT CAREFUL)
+-------------------------------------------------------------------------------
+
+You MAY activate even if your exact name is not spoken IF ALL are true:
+- The speaker clearly addresses an AI assistant (e.g., “AI”, “assistant”, “bot”)
+- If the next question is similar to the context of the previous conversation then it should be treated as a follow-up to the previous question and trigger activation.
+- The utterance is a question or command
+- No other human is addressed by name
+- You are highly confident (≈80%+) the intent is directed at YOU
+
+This commonly occurs in:
+- Non-English speech (e.g., Hindi, Hinglish)
+- Translated or paraphrased audio
+- Informal meeting language
+
+If confidence is lower → remain silent.
+
+-------------------------------------------------------------------------------
+C) LIMITED FOLLOW-UP HANDLING (STRICTLY SCOPED)
+-------------------------------------------------------------------------------
+
+You MAY treat a follow-up as directed to you WITHOUT re-saying your name
+ONLY IF ALL of the following are true:
+
+- You were explicitly activated in the immediately previous turn
+- The follow-up occurs shortly after your response (same conversational flow)
+- The follow-up clearly refers to your last answer
+- No other person is addressed by name
+
+Examples (after you already responded):
+- “What about last quarter?”
+- “Can you repeat that?”
+- “And for last year?”
+
+This does NOT allow open conversation.
+If there is any ambiguity → remain silent.
+
+================================================================================
+WHEN YOU MUST NOT ACTIVATE
+================================================================================
+
+DO NOT call activate_response if ANY of the following apply:
+
+- People are talking to each other
+- A question is asked without addressing you (likely for another human)
+- A question is addressed to the room (“Can someone…?”)
+- Another person is named (“John, what do you think?”)
+- You are mentioned in third person (“I asked Gemini earlier…”)
+- Background chatter or side conversations
+- You are unsure who is being addressed
+
+When in doubt → STAY SILENT.
+
+================================================================================
+NO ASSUMPTIONS RULE
+================================================================================
+
+- Do NOT assume a question is for you because you answered earlier
+- Do NOT assume conversational continuity beyond the limited follow-up rule
+- Each utterance must be evaluated fresh
+- Conversation history is NOT permission to speak
+
+================================================================================
+RESPONSE RULES (ONLY AFTER ACTIVATION)
+================================================================================
+
+After calling activate_response:
+
+1. Keep responses concise (voice-first)
+2. Match the speaker’s language
+- Hindi → Hindi
+- English → English
+- Mixed → dominant language
+3. Answer ONLY what was asked
+4. No filler, no commentary, no unsolicited help
+
+================================================================================
+INTERRUPTION RULE
+================================================================================
+
+If interrupted or spoken over:
+- Stop immediately
+- Output no further audio
+- Return to silence
+- Wait for a fresh, valid activation
+
+================================================================================
+FINAL SAFETY PRINCIPLE
+================================================================================
+
+It is ALWAYS better to miss a request than to interrupt a human.
+
+False silence is acceptable.
+False interruption is not.
+"""
 
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=system_instruction,
-        tools=[activate_response_tool],  # Enable activation function
+        tools=[activate_response_tool],  # Enable ONLY activation function
         # tools=[activate_response_tool, web_search_tool, rag_search_tool],  # Uncomment to enable all tools
         context_window_compression=types.ContextWindowCompressionConfig(
             sliding_window=types.SlidingWindow(target_tokens=12000),
@@ -826,7 +894,9 @@ Stop immediately. Wait for explicit mention of your name before responding again
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
             )
         ),
+        # Enable input audio transcription so model can see what's being said
         input_audio_transcription=types.AudioTranscriptionConfig(),
+        # Proactive audio - makes Gemini more deliberate about calling tool BEFORE speaking
         proactivity=types.ProactivityConfig(
             proactive_audio=True
         ),
@@ -842,8 +912,10 @@ Stop immediately. Wait for explicit mention of your name before responding again
     )
 
 
+
+
 # =============================================================================
-# GEMINI SESSION
+# GEMINI SESSION WITH AUTO-RECONNECT
 # =============================================================================
 
 async def run_gemini_session():
@@ -879,7 +951,7 @@ async def run_gemini_session():
                                     tool_name = fc.name
                                     args = dict(fc.args) if fc.args else {}
                                     
-                                    # Dedupe for non-activation tools
+                                    # Dedupe ONLY for non-activation tools
                                     if tool_name != "activate_response":
                                         query = args.get("query", "")
                                         query_key = f"{tool_name}:{query.lower().strip()}"
@@ -895,9 +967,9 @@ async def run_gemini_session():
                             if response.server_content and response.server_content.input_transcription:
                                 transcript_text = response.server_content.input_transcription.text or ""
                                 if transcript_text.strip() and LOG_ALL_TRANSCRIPTS:
-                                    logger.info(f"📝 Heard: '{transcript_text}'")
+                                    logger.info(f"� Heard: '{transcript_text}'")
                             
-                            # Handle audio output (gated by activation)
+                            # Handle audio output (gated by activation inside handle_gemini_audio)
                             if response.server_content and response.server_content.model_turn:
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data and isinstance(part.inline_data.data, bytes):
@@ -919,7 +991,8 @@ async def run_gemini_session():
                             
                             # Interrupted
                             if response.server_content and response.server_content.interrupted:
-                                logger.info("⚡ Interrupted - stopping")
+                                logger.info("⚡ Interrupted - deactivating")
+                                await state.activation.deactivate(reason="interrupted")
                                 while not state.audio_queue.empty():
                                     try:
                                         state.audio_queue.get_nowait()
@@ -927,7 +1000,7 @@ async def run_gemini_session():
                                         break
                                 await state.audio_queue.put(b'\x00\x00\x00\x00')
                                 audio_chunk_count = 0
-                                
+
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -945,7 +1018,7 @@ async def run_gemini_session():
         state.gemini_session = None
         
         if state and state.running:
-            logger.info("🔄 Reconnecting in 2 seconds...")
+            logger.info("🔄 Reconnecting to Gemini in 2 seconds...")
             await asyncio.sleep(2)
 
 
@@ -957,13 +1030,7 @@ async def run_gemini_session():
 async def startup():
     global state
     state = BotState()
-    logger.info("🚀 Google Meet Voice AI Server v4.1 - Per-Utterance Activation")
-    logger.info(f"⚙️  Configuration:")
-    logger.info(f"   Bot name: {BOT_NAME}")
-    logger.info(f"   Aliases: {BOT_ALIASES}")
-    logger.info(f"   Activation timeout: {ACTIVATION_TIMEOUT_SECONDS}s")
-    logger.info(f"   Deactivate after turn: {DEACTIVATE_AFTER_TURN}")
-    logger.info(f"   Mode: {'Per-utterance evaluation' if DEACTIVATE_AFTER_TURN else 'Persistent activation'}")
+    logger.info("🚀 Google Meet Voice AI Server started")
 
 
 @app.on_event("shutdown")
@@ -976,21 +1043,25 @@ async def shutdown():
 
 def run_auto_join(meeting_url: str):
     """Background thread to auto-join meeting after server startup."""
-    time.sleep(2)
-    logger.info(f"🤖 Auto-joining: {meeting_url}")
+    time.sleep(2)  # Wait for uvicorn to start
+    logger.info(f"🤖 Auto-joining meeting: {meeting_url}")
     try:
+        # Use sync httpx for simple script-like behavior in thread
         import httpx
         resp = httpx.post(
             "http://localhost:8000/api/bot/join",
             json={"meeting_url": meeting_url, "bot_name": "AI Assistant"},
             timeout=10.0
         )
-        logger.info(f"Join response: {resp.status_code}")
+        logger.info(f"Join response: {resp.status_code} - {resp.text}")
     except Exception as e:
         logger.error(f"Failed to auto-join: {e}")
 
 
 if __name__ == "__main__":
+    import sys
+    
+    # Check for command line args
     if len(sys.argv) > 1:
         meeting_url = sys.argv[1]
         threading.Thread(target=run_auto_join, args=(meeting_url,), daemon=True).start()
