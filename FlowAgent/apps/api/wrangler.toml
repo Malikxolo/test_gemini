@@ -1,0 +1,21 @@
+name = "flowagent-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[env.production]
+name = "flowagent-api-production"
+routes = [
+  { pattern = "api.flowagent.io", zone_name = "flowagent.io" }
+]
+
+[env.development]
+name = "flowagent-api-dev"
+
+# Environment variables (set via wrangler secret)
+# DATABASE_URL
+# UPSTASH_REDIS_REST_URL
+# UPSTASH_REDIS_REST_TOKEN
+# QSTASH_TOKEN
+# OPENAI_API_KEY
+# ANTHROPIC_API_KEY

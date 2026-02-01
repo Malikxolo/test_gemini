@@ -1,0 +1,32 @@
+service: flowagent-agent-engine
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-1
+  memorySize: 1024
+  timeout: 300
+  environment:
+    DATABASE_URL: ${env:DATABASE_URL}
+    OPENAI_API_KEY: ${env:OPENAI_API_KEY}
+    ANTHROPIC_API_KEY: ${env:ANTHROPIC_API_KEY}
+
+functions:
+  executeAgent:
+    handler: src/handlers/execute.handler
+    events:
+      - http:
+          path: /execute
+          method: post
+          cors: true
+    reservedConcurrency: 100
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  pythonRequirements:
+    dockerizePip: true
+    layer: true

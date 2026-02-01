@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+
+# Protect sensitive paths
+Disallow: /api/
+Disallow: /_next/
+Disallow: /auth/callback
+
+# Sitemap
+Sitemap: https://flowagent.io/sitemap.xml
