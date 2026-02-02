@@ -28,6 +28,7 @@ import uvicorn
 
 from google import genai
 from google.genai import types
+from google.oauth2 import service_account
 import openai
 
 # Load env
@@ -47,7 +48,12 @@ PUBLIC_URL = os.getenv("WEBHOOK_BASE_URL", "")
 RAG_API_URL = os.getenv("RAG_API_URL")
 BOT_API_KEY = os.getenv("BOT_API_KEY")
 
-MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+MODEL = "gemini-live-2.5-flash-native-audio"
+
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+USE_VERTEX_AI = os.getenv("USE_VERTEX_AI", "False").lower() == "true"
 
 
 # =============================================================================
@@ -203,11 +209,6 @@ class BotState:
         self.processed_call_ids = set()
         self.pending_queries = {}
         self.DEDUPE_WINDOW = 10
-        
-        # Wake word state - controls if bot should output audio
-        self.addressed = False
-        self.last_addressed_time = 0
-        self.FOLLOW_UP_TIMEOUT = 10  # seconds to allow follow-up without wake word
 
 
 state: BotState = None
@@ -442,8 +443,7 @@ async def execute_tool(fc, tool_name: str, query: str):
             function_response = types.FunctionResponse(
                 name=tool_name,
                 id=fc.id,
-                response={"result": result},
-                scheduling="WHEN_IDLE"
+                response={"result": result}
             )
             await state.gemini_session.send(input=types.LiveClientToolResponse(
                 function_responses=[function_response]
@@ -469,7 +469,6 @@ def get_gemini_config():
                     properties={"query": types.Schema(type=types.Type.STRING, description="The search query")},
                     required=["query"]
                 ),
-                behavior="NON_BLOCKING"
             )
         ]
     )
@@ -484,41 +483,43 @@ def get_gemini_config():
                     properties={"query": types.Schema(type=types.Type.STRING, description="The search query")},
                     required=["query"]
                 ),
-                behavior="NON_BLOCKING"
             )
         ]
     )
     
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction="""You are Gemini, a voice assistant in a Google Meet call.
+        system_instruction="""# ROLE:
+You are an "Always-Listening" Business Assistant in a Google Meet. 
 
-RULE 1 - WAKE WORD REQUIRED:
-Only respond when you hear "Gemini" or "Hey Gemini" followed by a question.
-If you DO NOT hear "Gemini" in the current utterance, say NOTHING at all.
+# ACTIVATION RULES (CRITICAL):
+1. **WAKE-WORD:** You must UNMISTAKABLY respond every time you hear "Gemini" or "Hey Gemini". Even if it is just a greeting, acknowledge it instantly (e.g., "I'm listening, how can I help?").
+2. **ACTIVE STATE:** Once a user addresses you, enter "ACTIVE STATE". In this state, you MUST respond to every subsequent utterance as a follow-up, even without your name. 
+   - Example: If asked about "Lucknow weather", then the user says "What about Delhi?", you MUST unmistakably respond with Delhi's weather immediately.
+3. **DEACTIVATION:** Only exit "ACTIVE STATE" and return to "Silent Observer" after 20 seconds of silence or if a user says "Thank you" or "That's all".
 
-RULE 2 - NOTHING means NOTHING:
-When you should not respond, generate absolutely zero audio.
-Do not say "okay", "I understand", or any acknowledgment.
-Just end your turn with no sound.
+# TOOL USE RULES:
+1. **WEB SEARCH:** Use 'web_search' ONLY for real-time data like weather, news, or stocks. Do not use it for things you already know or for internal company info.
+2. **PRECISION:** If you need a tool, trigger it silently and then provide the answer in a natural voice.
 
-RULE 3 - AFTER INTERRUPTION:
-If someone interrupts you, stop speaking and return to waiting.
-Wait for "Gemini" + new question before speaking again.
+# POST-TOOL BEHAVIOR:
+- After you use 'web_search' and provide the answer, you MUST remain in "ACTIVE STATE".
+- Do NOT consider the conversation finished just because you provided search results.
+- Anticipate follow-up questions immediately (e.g., "What about Delhi?"). You must answer these follow-ups without needing your name called again.
+- Stay "Active" and "Responsive" until the user explicitly says "Thank you" or stays silent for more than 30 seconds.
 
-RULE 4 - LANGUAGE MIRRORING:
-Always respond in the same language the user spoke.
-Never mix languages.
+# LANGUAGE MIRRORING:
+- You MUST detect the speaker's language and respond in that EXACT same language. 
+- If the user switches from English to Hindi (or any other language), you MUST switch unmistakably and immediately.
 
-TOOLS:
-Use web_search for web information.
-Use rag_search for company knowledge.""",
+# TONE:
+- Be concise. Speak like a human colleague, not a robot.""",
 
-        tools=[web_search_tool, rag_search_tool],
-        context_window_compression=types.ContextWindowCompressionConfig(
-            sliding_window=types.SlidingWindow(target_tokens=12000),
-            trigger_tokens=24000
-        ),
+        tools=[web_search_tool],
+        # context_window_compression=types.ContextWindowCompressionConfig(
+        #     sliding_window=types.SlidingWindow(target_tokens=12000),
+        #     trigger_tokens=24000
+        # ),
         thinking_config=types.ThinkingConfig(thinking_budget=0),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
@@ -536,8 +537,8 @@ Use rag_search for company knowledge.""",
                 disabled=False,
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                 end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                prefix_padding_ms=50,
-                silence_duration_ms=1500
+                prefix_padding_ms=200,
+                silence_duration_ms=800
             )
         )
     )
@@ -550,7 +551,30 @@ Use rag_search for company knowledge.""",
 async def run_gemini_session():
     global state
     
-    client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1alpha'})
+    if USE_VERTEX_AI:
+        logger.info("🔷 Using Vertex AI")
+
+        SCOPES = ['https://www.googleapis.com/auth/cloud-platform']
+
+
+        credentials = service_account.Credentials.from_service_account_file(
+            GOOGLE_APPLICATION_CREDENTIALS,
+            scopes=SCOPES
+        )
+        client = genai.Client(
+            vertexai=True,
+            project=GOOGLE_CLOUD_PROJECT,
+            location=GOOGLE_CLOUD_LOCATION,
+            credentials=credentials,
+            http_options={'api_version': 'v1'}
+        )
+    else:
+        logger.info("🔶 Using AI Studio")
+        client = genai.Client(
+            api_key=GOOGLE_API_KEY,
+            http_options={'api_version': 'v1alpha'}
+        )
+
     config = get_gemini_config()
     
     while state and state.running:
@@ -587,50 +611,25 @@ async def run_gemini_session():
                                     
                                     asyncio.create_task(execute_tool(fc, fc.name, query))
                             
-                            # Check input transcription for wake word "Gemini"
+                            # Log input transcription
                             if response.server_content and response.server_content.input_transcription:
-                                transcript_text = response.server_content.input_transcription.text or ""
-                                transcript_lower = transcript_text.lower()
-                                
-                                # Detect wake word
-                                if "gemini" in transcript_lower or "jimini" in transcript_lower or "geminy" in transcript_lower:
-                                    state.addressed = True
-                                    state.last_addressed_time = time.time()
-                                    logger.info(f"🎯 WAKE WORD detected in: '{transcript_text}'")
-                                else:
-                                    # Check if still in follow-up window
-                                    time_since_addressed = time.time() - state.last_addressed_time
-                                    if time_since_addressed > state.FOLLOW_UP_TIMEOUT:
-                                        if state.addressed:
-                                            logger.info(f"⏱️ Follow-up timeout, resetting to LISTENING")
-                                        state.addressed = False
-                                    else:
-                                        logger.debug(f"📝 Transcript (no wake word, in follow-up window): '{transcript_text}'")
-                            
-                            # Handle audio output - GATED by addressed state
+                                transcript = response.server_content.input_transcription.text
+                                if transcript:
+                                    logger.info(f"🗣️ User: {transcript}")
+
+                            # Handle audio output - NO GATING
                             if response.server_content and response.server_content.model_turn:
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data and isinstance(part.inline_data.data, bytes):
                                         audio_chunk_count += 1
-                                        
-                                        # Only output audio if bot was addressed
-                                        if state.addressed:
-                                            if audio_chunk_count == 1:
-                                                logger.info("🔊 First audio chunk (addressed=True)")
-                                            await handle_gemini_audio(part.inline_data.data)
-                                        else:
-                                            # Suppress audio - bot wasn't addressed
-                                            if audio_chunk_count == 1:
-                                                logger.info("🔇 Suppressing audio (addressed=False)")
+                                        await handle_gemini_audio(part.inline_data.data)
                             
                             if response.server_content and response.server_content.turn_complete:
-                                logger.info(f"✓ Turn complete ({audio_chunk_count} chunks, addressed={state.addressed})")
+                                logger.info(f"✓ Turn complete ({audio_chunk_count} chunks)")
                                 audio_chunk_count = 0
                             
                             if response.server_content and response.server_content.interrupted:
-                                # CRITICAL: Reset to LISTENING state on ANY interruption
-                                logger.info(f"⚡ Interrupted - resetting to LISTENING state")
-                                state.addressed = False
+                                logger.info(f"⚡ Interrupted")
                                 
                                 # Clear pending audio output
                                 while not state.audio_queue.empty():
@@ -678,6 +677,13 @@ async def shutdown():
     global state
     if state:
         state.running = False
+        if state.bot_id:
+            logger.info(f"👋 Leaving meeting (Bot ID: {state.bot_id})...")
+            try:
+                await state.recall.leave_call(state.bot_id)
+                logger.info("✅ Left meeting")
+            except Exception as e:
+                logger.error(f"❌ Failed to leave meeting: {e}")
     logger.info("🔌 Server shutdown")
 
 
