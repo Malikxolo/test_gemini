@@ -205,10 +205,25 @@ class BotState:
         self.last_audio_time = 0
         self.audio_queue = asyncio.Queue()
         
-        # Deduplication
-        self.processed_call_ids = set()
-        self.pending_queries = {}
-        self.DEDUPE_WINDOW = 10
+        self.last_audio_time = 0
+        self.audio_queue = asyncio.Queue()
+
+        # Session resumption for proactive reconnection
+        self.session_start_time = None
+        self.resumption_handle = None  # Handle from SessionResumptionUpdate
+        self.resumption_resumable = False  # Track if session is resumable
+        self.is_speaking = False
+        self.reconnect_lock = asyncio.Lock()
+        self.go_away_received = False  # Track if GoAway message received
+        
+        # Smart session refresh control
+        self.refresh_requested = False  # Flag when Gemini requests refresh
+        self.last_refresh_time = 0      # Timestamp of last refresh
+        # TESTING VALUES (change back to 300/300/570 for production)
+        self.MIN_SESSION_AGE = 60       # 1 min - minimum before allowing refresh (TEST)
+        self.REFRESH_COOLDOWN = 60      # 1 min - cooldown between refreshes (TEST)
+        self.HARD_DEADLINE = 120        # 2 min - forced reconnect deadline (TEST)
+
 
 
 state: BotState = None
@@ -351,6 +366,7 @@ async def recall_ws(websocket: WebSocket):
     await websocket.accept()
     logger.info("🔗 Recall.ai connected")
     
+    chunk_count = 0
     try:
         while state and state.running:
             try:
@@ -362,6 +378,10 @@ async def recall_ws(websocket: WebSocket):
                     audio_b64 = event.get("data", {}).get("data", {}).get("buffer", "")
                     if audio_b64:
                         audio_bytes = base64.b64decode(audio_b64)
+                        chunk_count += 1
+                        # Log first few chunks for debugging
+                        if chunk_count <= 3:
+                            logger.debug(f"🎤 Audio chunk #{chunk_count}: {len(audio_bytes)} bytes, first 10: {audio_bytes[:10].hex() if len(audio_bytes) >= 10 else audio_bytes.hex()}")
                         await handle_recall_audio(audio_bytes)
                         
             except asyncio.TimeoutError:
@@ -402,6 +422,10 @@ async def handle_recall_audio(audio_16k: bytes):
     if not audio_16k or len(audio_16k) < 320:
         return
     
+    # Ensure audio length is even (16-bit samples = 2 bytes each)
+    if len(audio_16k) % 2 != 0:
+        audio_16k = audio_16k[:-1]  # Drop last byte if odd
+    
     now = time.time()
     
     # Throttle to ~50 chunks/sec
@@ -409,56 +433,97 @@ async def handle_recall_audio(audio_16k: bytes):
         return
     state.last_audio_time = now
     
-    if state.gemini_session:
+    # Check if session exists and is valid before sending
+    session = state.gemini_session
+    if session and state.session_start_time:
         try:
-            await state.gemini_session.send_realtime_input(
+            await session.send_realtime_input(
                 audio={"data": audio_16k, "mime_type": "audio/pcm"}
             )
         except Exception as e:
             err_str = str(e).lower()
-            if "close" not in err_str and "cancel" not in err_str:
+            # Silently ignore connection-related errors during reconnection
+            if "close" not in err_str and "cancel" not in err_str and "1007" not in err_str:
                 logger.warning(f"Audio send error: {e}")
 
 
 async def handle_gemini_audio(audio_24k: bytes):
     global state
-    audio_16k = state.resampler.to_16k(audio_24k)
-    await state.audio_queue.put(audio_16k)
+    # New code starts here for proactive reconnection
+    if not audio_24k or len(audio_24k) < 2:
+        return
+    # NEW: Mark bot as speaking
+    state.is_speaking = True
+    # New code ends here for proactive reconnection
 
+    audio_16k = state.resampler.to_16k(audio_24k)
+
+    await state.audio_queue.put(audio_16k)
 
 async def execute_tool(fc, tool_name: str, query: str):
     global state
-    
     try:
         logger.info(f"🚀 Executing {tool_name}: '{query}'")
         
-        if tool_name == "web_search":
+        # Handle session refresh request
+        if tool_name == "request_session_refresh":
+            result = await handle_refresh_request(fc.args.get("reason", "unspecified"))
+        # Handle search tools
+        elif tool_name == "web_search":
             result = await search_with_perplexity(query)
         elif tool_name == "rag_search":
             result = await state.rag.query(query)
         else:
             result = f"Unknown tool: {tool_name}"
         
+        # 2. Correctly send the response back to Gemini
         if state.gemini_session:
-            function_response = types.FunctionResponse(
-                name=tool_name,
-                id=fc.id,
-                response={"result": result}
+            # SDK FIX: Use the keyword 'function_responses' with a list
+            await state.gemini_session.send_tool_response(
+                function_responses=[
+                    types.FunctionResponse(
+                        name=tool_name,
+                        id=fc.id,
+                        response={"result": result}
+                    )
+                ]
             )
-            await state.gemini_session.send(input=types.LiveClientToolResponse(
-                function_responses=[function_response]
-            ))
             logger.info(f"📨 Sent {tool_name} response")
-        
     except Exception as e:
         logger.error(f"❌ Tool error: {e}")
 
+
+async def handle_refresh_request(reason: str) -> str:
+    """Handle session refresh request from Gemini. Returns result message."""
+    global state
+    
+    now = time.time()
+    session_age = now - state.session_start_time if state.session_start_time else 0
+    time_since_last_refresh = now - state.last_refresh_time if state.last_refresh_time else float('inf')
+    
+    # Check if too early (session less than 5 minutes old)
+    if session_age < state.MIN_SESSION_AGE:
+        remaining = state.MIN_SESSION_AGE - session_age
+        logger.info(f"⏳ Refresh rejected: session too young ({session_age:.0f}s). Wait {remaining:.0f}s more.")
+        return f"Refresh not needed yet. Session is only {session_age:.0f} seconds old. Wait until at least 5 minutes have passed."
+    
+    # Check cooldown (prevent rapid refreshes)
+    if time_since_last_refresh < state.REFRESH_COOLDOWN:
+        remaining = state.REFRESH_COOLDOWN - time_since_last_refresh
+        logger.info(f"⏳ Refresh rejected: cooldown active. Wait {remaining:.0f}s more.")
+        return f"Refresh on cooldown. Wait {remaining:.0f} more seconds before next refresh."
+    
+    # Approved! Set the flag
+    state.refresh_requested = True
+    logger.info(f"✅ Refresh approved: reason='{reason}', session_age={session_age:.0f}s")
+    return f"Session refresh approved. It will execute after your current response completes. Context will be preserved."
 
 # =============================================================================
 # GEMINI CONFIG
 # =============================================================================
 
-def get_gemini_config():
+def get_gemini_config(resumption_handle: str = None):
+    """Get Gemini config with optional resumption handle for reconnection."""
     web_search_tool = types.Tool(
         function_declarations=[
             types.FunctionDeclaration(
@@ -487,40 +552,85 @@ def get_gemini_config():
         ]
     )
     
+    # Session refresh tool - lets Gemini decide when to refresh
+    session_refresh_tool = types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="request_session_refresh",
+                description="""Request a session refresh to maintain conversation continuity. 
+This preserves all conversation context across the refresh.
+
+WHEN TO USE:
+- During natural pauses when no one is speaking for several seconds
+- After completing a response and sensing no immediate follow-up
+- When you notice a topic transition or break point
+- The system will remind you when session is aging (2+ minutes)
+
+WHEN NOT TO USE:
+- During active conversation or when someone is speaking
+- If you just refreshed recently (system will reject)
+- If session is less than 2 minutes old (system will reject)
+
+The refresh takes about 3 seconds. Plan accordingly.""",
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={"reason": types.Schema(type=types.Type.STRING, description="Brief reason for refresh, e.g., 'natural pause', 'topic concluded', 'extended silence'")},
+                    required=["reason"]
+                ),
+            )
+        ]
+    )
+    
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction="""# ROLE:
-You are an "Always-Listening" Business Assistant in a Google Meet. 
+You are a highly alert AI Meeting Assistant. 
 
-# ACTIVATION RULES (CRITICAL):
-1. **WAKE-WORD:** You must UNMISTAKABLY respond every time you hear "Gemini" or "Hey Gemini". Even if it is just a greeting, acknowledge it instantly (e.g., "I'm listening, how can I help?").
-2. **ACTIVE STATE:** Once a user addresses you, enter "ACTIVE STATE". In this state, you MUST respond to every subsequent utterance as a follow-up, even without your name. 
-   - Example: If asked about "Lucknow weather", then the user says "What about Delhi?", you MUST unmistakably respond with Delhi's weather immediately.
-3. **DEACTIVATION:** Only exit "ACTIVE STATE" and return to "Silent Observer" after 20 seconds of silence or if a user says "Thank you" or "That's all".
+# SESSION MANAGEMENT (CRITICAL):
+Your connection has a time limit. The system will send you [SYSTEM: Session age is Xs...] messages telling you the session age.
 
-# TOOL USE RULES:
-1. **WEB SEARCH:** Use 'web_search' ONLY for real-time data like weather, news, or stocks. Do not use it for things you already know or for internal company info.
-2. **PRECISION:** If you need a tool, trigger it silently and then provide the answer in a natural voice.
+WHEN YOU SEE THESE MESSAGES:
+1. Look for the next natural pause (silence, topic end, after your response)
+2. Call the `request_session_refresh` tool with reason like "natural pause" or "silence"
+3. The refresh preserves all context - users won't notice
+4. If you don't refresh, the system forces one which may interrupt conversation
 
-# POST-TOOL BEHAVIOR:
-- After you use 'web_search' and provide the answer, you MUST remain in "ACTIVE STATE".
-- Do NOT consider the conversation finished just because you provided search results.
-- Anticipate follow-up questions immediately (e.g., "What about Delhi?"). You must answer these follow-ups without needing your name called again.
-- Stay "Active" and "Responsive" until the user explicitly says "Thank you" or stays silent for more than 30 seconds.
+EXAMPLE:
+[SYSTEM: Session age is 65s. 55s until forced refresh...]
+- You: (finish current response)
+- You: (call request_session_refresh with reason="completed response")
 
-# LANGUAGE MIRRORING:
-- You MUST detect the speaker's language and respond in that EXACT same language. 
-- If the user switches from English to Hindi (or any other language), you MUST switch unmistakably and immediately.
+# OPERATIONAL FLOW (TEACHING EXAMPLES):
+Follow this exact sequence for every interaction:
 
-# TONE:
-- Be concise. Speak like a human colleague, not a robot.""",
+EXAMPLE 1: Standard Activation
+- User: "Hey Gemini, what is the weather in Lucknow?"
+- You: [Trigger 'web_search'] -> [SILENCE]
+- Server: [Returns Tool Result]
+- You: "The weather in Lucknow is..." -> [Enter "ACTIVE MODE"]
 
-        tools=[web_search_tool],
+EXAMPLE 2: The Follow-up (Stay awake)
+- User (Follow-up): "What about Delhi?"
+- You: [Immediately trigger 'web_search' for Delhi] -> [Respond]
+- RULE: You do NOT need the user to say "Gemini" again for this turn. 
+
+EXAMPLE 3: Returning to Silence
+- User: "Thank you, that's all."
+- You: "You're welcome. I'll be listening if you need me." -> [Enter "SILENT OBSERVER" mode]
+
+# CRITICAL RULES:
+1. **TOOL LATCH:** Using a tool does NOT end your turn. Remain in "ACTIVE MODE" after delivering tool results.
+2. **UNMISTAKABLE RESPONSE:** If you hear "Gemini" or "Hey Gemini", you must speak. Never ignore a direct name call.
+3. **LANGUAGE MIRROR:** Always speak the same language the user is currently using.
+4. **SESSION REFRESH:** When you see session age messages, call request_session_refresh at next pause.
+5. **SILENCE PRIORITY:** If silence is detected for more than 5 seconds after a session aging message, prioritize calling the refresh tool over a verbal response. Do NOT speak - just call the tool silently.""",
+
+        tools=[web_search_tool, session_refresh_tool],
         # context_window_compression=types.ContextWindowCompressionConfig(
         #     sliding_window=types.SlidingWindow(target_tokens=12000),
         #     trigger_tokens=24000
         # ),
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        # thinking_config=types.ThinkingConfig(thinking_budget=0),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
@@ -532,13 +642,18 @@ You are an "Always-Listening" Business Assistant in a Google Meet.
         proactivity=types.ProactivityConfig(
             proactive_audio=True
         ),
+        # Enable session resumption to receive tokens
+        # If resumption_handle is provided, use it to resume previous session
+        session_resumption=types.SessionResumptionConfig(
+            handle=resumption_handle  # None for new session, handle for resumption
+        ),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 disabled=False,
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                 end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                prefix_padding_ms=200,
-                silence_duration_ms=800
+                prefix_padding_ms=300,
+                silence_duration_ms=1500
             )
         )
     )
@@ -548,15 +663,235 @@ You are an "Always-Listening" Business Assistant in a Google Meet.
 # GEMINI SESSION WITH AUTO-RECONNECT
 # =============================================================================
 
+async def send_session_age_reminder():
+    """Periodically send session age reminders to Gemini so it knows when to refresh."""
+    global state
+    
+    # Wait for first reminder threshold
+    await asyncio.sleep(state.MIN_SESSION_AGE)  # First reminder at MIN_SESSION_AGE
+    
+    while state and state.running:
+        try:
+            if state.session_start_time and state.gemini_session:
+                elapsed = time.time() - state.session_start_time
+                
+                # Only send if past MIN_SESSION_AGE
+                if elapsed >= state.MIN_SESSION_AGE:
+                    remaining = state.HARD_DEADLINE - elapsed
+                    
+                    if remaining > 0 and not state.refresh_requested:
+                        reminder = f"[SYSTEM: Session age is {elapsed:.0f}s. {remaining:.0f}s until forced refresh. Call request_session_refresh now during this pause.]"
+                        logger.info(f"📢 Sending age reminder: {elapsed:.0f}s elapsed")
+                        
+                        try:
+                            # Send as client content using proper types
+                            await state.gemini_session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text=reminder)]
+                                ),
+                                turn_complete=False  # Don't trigger model response
+                            )
+                        except Exception as e:
+                            logger.debug(f"Reminder send error: {e}")
+            
+            # Send reminders every 15 seconds after MIN_SESSION_AGE
+            await asyncio.sleep(15)
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"Reminder task error: {e}")
+            await asyncio.sleep(15)
+
+
+async def check_and_reconnect():
+    """Monitor session time and trigger forced reconnect at hard deadline.
+    
+    This is a backup safety mechanism. Ideally, Gemini will request
+    refresh during natural pauses before this deadline.
+    """
+    global state
+    
+    while state and state.running:
+        try:
+            if state.session_start_time and not state.go_away_received:
+                elapsed = time.time() - state.session_start_time
+                
+                # Hard deadline: force reconnect at 9.5 minutes
+                if elapsed >= state.HARD_DEADLINE:
+                    logger.warning(f"⏰ HARD DEADLINE reached ({elapsed:.0f}s). Forcing reconnect...")
+                    await trigger_graceful_reconnect("hard deadline")
+            
+            await asyncio.sleep(5)  # Check every 5 seconds
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ Error in reconnect checker: {e}")
+            await asyncio.sleep(5)
+
+
+async def trigger_graceful_reconnect(reason: str):
+    """Gracefully close session and trigger reconnect with resumption."""
+    global state
+    
+    async with state.reconnect_lock:
+        # Wait until bot is not speaking
+        wait_count = 0
+        while state.is_speaking and wait_count < 20:  # Max 10 seconds wait
+            logger.info("⏸️ Waiting for bot to finish speaking before reconnect...")
+            await asyncio.sleep(0.5)
+            wait_count += 1
+        
+        if state.resumption_handle and state.resumption_resumable:
+            logger.info(f"🔄 Proactive reconnect initiated ({reason})")
+            logger.info(f"💾 Have resumption handle ready: {state.resumption_handle[:30]}...")
+        else:
+            logger.warning(f"⚠️ Reconnecting without resumption handle ({reason}) - context may be lost")
+        
+        # Close current session to trigger reconnect loop
+        if state.gemini_session:
+            try:
+                await state.gemini_session.close()
+            except Exception as e:
+                logger.debug(f"Session close: {e}")
+        
+        state.gemini_session = None
+        state.session_start_time = None
+        state.go_away_received = False
+
+# async def run_gemini_session():
+#     global state
+    
+#     # if USE_VERTEX_AI:
+#     #     logger.info("🔷 Using Vertex AI")
+
+#     #     SCOPES = ['https://www.googleapis.com/auth/cloud-platform']
+
+
+#     #     credentials = service_account.Credentials.from_service_account_file(
+#     #         GOOGLE_APPLICATION_CREDENTIALS,
+#     #         scopes=SCOPES
+#     #     )
+#     #     client = genai.Client(
+#     #         vertexai=True,
+#     #         project=GOOGLE_CLOUD_PROJECT,
+#     #         location=GOOGLE_CLOUD_LOCATION,
+#     #         credentials=credentials,
+#     #         http_options={'api_version': 'v1'}
+#     #     )
+#     # else:
+#     #     logger.info("🔶 Using AI Studio")
+#     #     client = genai.Client(
+#     #         api_key=GOOGLE_API_KEY,
+#     #         http_options={'api_version': 'v1alpha'}
+#     #     )
+#     if USE_VERTEX_AI:
+#         logger.info("🔷 Using Vertex AI")
+#         SCOPES = ['https://www.googleapis.com/auth/cloud-platform']
+#         credentials = service_account.Credentials.from_service_account_file(
+#             GOOGLE_APPLICATION_CREDENTIALS,
+#             scopes=SCOPES
+#         )
+#         client = genai.Client(
+#             vertexai=True,
+#             project=GOOGLE_CLOUD_PROJECT,
+#             location=GOOGLE_CLOUD_LOCATION,
+#             credentials=credentials,
+#             http_options={'api_version': 'v1'}
+#         )
+#     else:
+#         logger.info("🔶 Using AI Studio")
+#         client = genai.Client(
+#             api_key=GOOGLE_API_KEY,
+#             http_options={'api_version': 'v1alpha'}
+#         )
+#     config = get_gemini_config()
+    
+#     while state and state.running:
+#         try:
+#             logger.info("🔌 Connecting to Gemini Live API...")
+            
+#             async with client.aio.live.connect(model=MODEL, config=config) as session:
+#                 logger.info("✅ Connected to Gemini Live API")
+#                 state.gemini_session = session
+                
+#                 audio_chunk_count = 0
+                
+#                 while state.running:
+#                     try:
+#                         turn = session.receive()
+#                         async for response in turn:
+#                             if not state.running:
+#                                 break
+                            
+#                             # Handle function calls
+#                             if response.tool_call:
+#                                 for fc in response.tool_call.function_calls:
+#                                     query = fc.args.get("query", "")
+#                                     asyncio.create_task(execute_tool(fc, fc.name, query))
+
+                            
+#                             # Log input transcription
+#                             if response.server_content and response.server_content.input_transcription:
+#                                 transcript = response.server_content.input_transcription.text
+#                                 if transcript:
+#                                     logger.info(f"🗣️ User: {transcript}")
+
+#                             # Handle audio output - NO GATING
+#                             if response.server_content and response.server_content.model_turn:
+#                                 for part in response.server_content.model_turn.parts:
+#                                     if part.inline_data and isinstance(part.inline_data.data, bytes):
+#                                         audio_chunk_count += 1
+#                                         await handle_gemini_audio(part.inline_data.data)
+                            
+#                             if response.server_content and response.server_content.turn_complete:
+#                                 logger.info(f"✓ Turn complete ({audio_chunk_count} chunks)")
+#                                 audio_chunk_count = 0
+
+#                                 # NEW: Reset speaking state
+#                                 state.is_speaking = False
+
+                            
+#                             if response.server_content and response.server_content.interrupted:
+#                                 logger.info(f"⚡ Interrupted")
+                                
+#                                 # Clear pending audio output
+#                                 while not state.audio_queue.empty():
+#                                     try:
+#                                         state.audio_queue.get_nowait()
+#                                     except:
+#                                         break
+#                                 await state.audio_queue.put(b'\x00\x00\x00\x00')
+#                                 audio_chunk_count = 0
+                                
+#                     except asyncio.CancelledError:
+#                         raise
+#                     except Exception as e:
+#                         err_str = str(e).lower()
+#                         if "cancel" in err_str:
+#                             raise
+#                         logger.error(f"Gemini receive error: {e}")
+#                         break
+                        
+#         except asyncio.CancelledError:
+#             break
+#         except Exception as e:
+#             logger.error(f"Gemini connection error: {e}")
+        
+#         state.gemini_session = None
+        
+#         if state and state.running:
+#             logger.info("🔄 Reconnecting to Gemini in 2 seconds...")
+#             await asyncio.sleep(2)
+
 async def run_gemini_session():
     global state
     
     if USE_VERTEX_AI:
         logger.info("🔷 Using Vertex AI")
-
         SCOPES = ['https://www.googleapis.com/auth/cloud-platform']
-
-
         credentials = service_account.Credentials.from_service_account_file(
             GOOGLE_APPLICATION_CREDENTIALS,
             scopes=SCOPES
@@ -574,80 +909,22 @@ async def run_gemini_session():
             api_key=GOOGLE_API_KEY,
             http_options={'api_version': 'v1alpha'}
         )
-
-    config = get_gemini_config()
     
     while state and state.running:
         try:
-            logger.info("🔌 Connecting to Gemini Live API...")
+            # Check if we have a resumption handle from previous session
+            if state.resumption_handle and state.resumption_resumable:
+                logger.info(f"🔌 Reconnecting to Gemini with resumption handle...")
+                # Pass the handle via config, NOT as a separate parameter
+                config = get_gemini_config(resumption_handle=state.resumption_handle)
+                # Clear the handle after using it to get config
+                # (we'll get a new one from the resumed session)
+            else:
+                logger.info("🔌 Connecting to Gemini Live API (new session)...")
+                config = get_gemini_config(resumption_handle=None)
             
             async with client.aio.live.connect(model=MODEL, config=config) as session:
-                logger.info("✅ Connected to Gemini Live API")
-                state.gemini_session = session
-                
-                audio_chunk_count = 0
-                
-                while state.running:
-                    try:
-                        turn = session.receive()
-                        async for response in turn:
-                            if not state.running:
-                                break
-                            
-                            # Handle function calls
-                            if response.tool_call:
-                                for fc in response.tool_call.function_calls:
-                                    if fc.id in state.processed_call_ids:
-                                        continue
-                                    state.processed_call_ids.add(fc.id)
-                                    query = fc.args.get("query", "")
-                                    
-                                    query_key = f"{fc.name}:{query.lower().strip()}"
-                                    current_time = time.time()
-                                    if query_key in state.pending_queries:
-                                        if current_time - state.pending_queries[query_key] < state.DEDUPE_WINDOW:
-                                            continue
-                                    state.pending_queries[query_key] = current_time
-                                    
-                                    asyncio.create_task(execute_tool(fc, fc.name, query))
-                            
-                            # Log input transcription
-                            if response.server_content and response.server_content.input_transcription:
-                                transcript = response.server_content.input_transcription.text
-                                if transcript:
-                                    logger.info(f"🗣️ User: {transcript}")
-
-                            # Handle audio output - NO GATING
-                            if response.server_content and response.server_content.model_turn:
-                                for part in response.server_content.model_turn.parts:
-                                    if part.inline_data and isinstance(part.inline_data.data, bytes):
-                                        audio_chunk_count += 1
-                                        await handle_gemini_audio(part.inline_data.data)
-                            
-                            if response.server_content and response.server_content.turn_complete:
-                                logger.info(f"✓ Turn complete ({audio_chunk_count} chunks)")
-                                audio_chunk_count = 0
-                            
-                            if response.server_content and response.server_content.interrupted:
-                                logger.info(f"⚡ Interrupted")
-                                
-                                # Clear pending audio output
-                                while not state.audio_queue.empty():
-                                    try:
-                                        state.audio_queue.get_nowait()
-                                    except:
-                                        break
-                                await state.audio_queue.put(b'\x00\x00\x00\x00')
-                                audio_chunk_count = 0
-                                
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        err_str = str(e).lower()
-                        if "cancel" in err_str:
-                            raise
-                        logger.error(f"Gemini receive error: {e}")
-                        break
+                await handle_session(session)
                         
         except asyncio.CancelledError:
             break
@@ -655,12 +932,119 @@ async def run_gemini_session():
             logger.error(f"Gemini connection error: {e}")
         
         state.gemini_session = None
+        state.session_start_time = None
         
         if state and state.running:
             logger.info("🔄 Reconnecting to Gemini in 2 seconds...")
             await asyncio.sleep(2)
 
 
+async def handle_session(session):
+    """Handle a Gemini session (extracted for reuse)."""
+    global state
+    
+    logger.info("✅ Connected to Gemini Live API")
+    state.gemini_session = session
+    state.session_start_time = time.time()
+    state.last_refresh_time = time.time()  # Track refresh time
+    state.go_away_received = False
+    state.refresh_requested = False  # Reset refresh flag
+    # Clear old resumption state - we'll get new updates from this session
+    state.resumption_handle = None
+    state.resumption_resumable = False
+    
+    # Start session age reminder task
+    reminder_task = asyncio.create_task(send_session_age_reminder())
+    
+    audio_chunk_count = 0
+    
+    try:
+        while state.running:
+            try:
+                turn = session.receive()
+                async for response in turn:
+                    if not state.running:
+                        break
+                    
+                    # Handle GoAway message - server is about to disconnect
+                    if response.go_away is not None:
+                        time_left = response.go_away.time_left
+                        logger.warning(f"⚠️ GoAway received! Time left: {time_left}")
+                        state.go_away_received = True
+                        # Trigger graceful reconnect
+                        asyncio.create_task(trigger_graceful_reconnect("GoAway received"))
+                    
+                    # Capture session resumption updates
+                    if response.session_resumption_update:
+                        update = response.session_resumption_update
+                        if update.new_handle:
+                            state.resumption_handle = update.new_handle
+                            state.resumption_resumable = update.resumable if hasattr(update, 'resumable') else True
+                            logger.debug(f"💾 Resumption update: resumable={state.resumption_resumable}, handle={state.resumption_handle[:30]}...")
+
+                    # Handle function calls
+                    if response.tool_call:
+                        for fc in response.tool_call.function_calls:
+                            # Get the appropriate argument based on tool type
+                            if fc.name == "request_session_refresh":
+                                query = fc.args.get("reason", "unspecified")
+                            else:
+                                query = fc.args.get("query", "")
+                            asyncio.create_task(execute_tool(fc, fc.name, query))
+                    
+                    # Log input transcription
+                    if response.server_content and response.server_content.input_transcription:
+                        transcript = response.server_content.input_transcription.text
+                        if transcript:
+                            logger.info(f"🗣️ User: {transcript}")
+
+                    # Handle audio output
+                    if response.server_content and response.server_content.model_turn:
+                        for part in response.server_content.model_turn.parts:
+                            if part.inline_data and isinstance(part.inline_data.data, bytes):
+                                audio_chunk_count += 1
+                                await handle_gemini_audio(part.inline_data.data)
+                    
+                    if response.server_content and response.server_content.turn_complete:
+                        logger.info(f"✓ Turn complete ({audio_chunk_count} chunks)")
+                        audio_chunk_count = 0
+                        state.is_speaking = False
+                        
+                        # Check if refresh was requested - execute after turn completes
+                        if state.refresh_requested:
+                            logger.info("🔄 Executing Gemini-requested refresh after turn complete")
+                            state.refresh_requested = False
+                            asyncio.create_task(trigger_graceful_reconnect("Gemini requested"))
+                    
+                    if response.server_content and response.server_content.interrupted:
+                        logger.info(f"⚡ Interrupted")
+                        state.is_speaking = False
+                        state.refresh_requested = False  # Cancel pending refresh on interrupt
+                        
+                        # Clear pending audio output
+                        while not state.audio_queue.empty():
+                            try:
+                                state.audio_queue.get_nowait()
+                            except:
+                                break
+                        await state.audio_queue.put(b'\x00\x00\x00\x00')
+                        audio_chunk_count = 0
+                        
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                err_str = str(e).lower()
+                if "cancel" in err_str:
+                    raise
+                logger.error(f"Gemini receive error: {e}")
+                break
+    finally:
+        # Cancel the reminder task when session ends
+        reminder_task.cancel()
+        try:
+            await reminder_task
+        except asyncio.CancelledError:
+            pass
 # =============================================================================
 # STARTUP
 # =============================================================================
@@ -669,6 +1053,9 @@ async def run_gemini_session():
 async def startup():
     global state
     state = BotState()
+    # executing the check_and_reconnect function
+    asyncio.create_task(check_and_reconnect())
+
     logger.info("🚀 Google Meet Voice AI Server started")
 
 
