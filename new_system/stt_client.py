@@ -36,7 +36,7 @@ class DeepgramSTTClient:
         encoding: str = "linear16",
         language: str = "multi",
         model: str = "nova-3",
-        endpointing: int = 500,
+        endpointing: int = 800,
         interim_results: bool = True,
         utterance_end_ms: int = 1000,
         vad_events: bool = True,

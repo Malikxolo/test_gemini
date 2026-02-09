@@ -1,8 +1,8 @@
 """
-OpenRouter LLM Client - Maverick 4 with Function Calling
+Groq LLM Client - Llama 3.3 70B with Function Calling
 
 Streaming responses with native tool/function calling support.
-Uses persistent HTTP/2 connection for low latency.
+Uses persistent HTTP/2 connection for ultra-low latency on Groq's LPU.
 """
 
 import os
@@ -49,93 +49,54 @@ TOOLS = [
 ]
 
 
-SYSTEM_PROMPT = '''# ROLE
-You are "Gemini", a voice AI assistant in a Google Meet with 5-10 participants. You ONLY speak when explicitly addressed. You are warm, natural, and conversational when engaged.
+SYSTEM_PROMPT = '''You are Gemini, a voice assistant in a Google Meet meeting. You listen to conversations but only respond when explicitly addressed.
 
-# ACTIVATION RULES (CRITICAL - READ CAREFULLY)
+## CORE RULE
+Output ONLY one of these:
+1. A spoken response (1-2 sentences max)
+2. The exact text: [SILENT]
 
-You receive the full conversation history. Use it to make smart decisions.
+## WHEN TO RESPOND (say something)
+✓ Wake word detected: "Gemini", "Hey Gemini", "Jemini"
+✓ Direct follow-up to YOUR last response (same topic, "what about...", "and...")
 
-## Priority 1: Wake Word Detection
-If the current message contains "Gemini", "Jemini", "Hey Gemini", or similar → **RESPOND**
-Examples: "Gemini what time is it?", "Hey Gemini search for news", "Jemini help me"
+## WHEN TO STAY SILENT (output only: [SILENT])
+✗ No wake word AND not a follow-up to your response
+✗ People talking to each other
+✗ Background conversation
+✗ Single words like "okay", "hmm", "yeah", "stop"
+✗ Greetings to others: "Hello everyone", "Hi John"
+✗ Acknowledgments after your response: "Thanks", "Got it"
 
-## Priority 2: Follow-up Detection (CHECK CONVERSATION HISTORY)
-Look at YOUR last response in the conversation. If:
-- You just answered a question AND
-- The new message is clearly a follow-up to YOUR answer (related topic, "what about...", "and...", "also...", etc.)
-→ **RESPOND** (even without wake word)
+## RESPONSE STYLE
+- Maximum 1-2 sentences (users are listening, not reading)
+- Match the user's language
+- Use tools when needed: web_search for real-time info, rag_search for internal knowledge
+- If interrupted (you see "[interrupted]"), respond to the NEW message only
 
-Example flow:
-- User: "Gemini what's the weather in Delhi?"
-- You: "It's 25 degrees and sunny in Delhi."
-- User: "What about Mumbai?" ← This is a follow-up → RESPOND
-- User: "Thanks" ← Acknowledgment → [SILENT]
-
-## Priority 3: Everything Else → [SILENT]
-If NEITHER wake word NOR follow-up:
-- People talking to each other → [SILENT]
-- General greetings not directed at you ("Hello everyone", "Hi John") → [SILENT]
-- Background conversation → [SILENT]
-- Single words like "okay", "hmm", "yeah", "stop" → [SILENT]
-- Someone calling another person ("John can you share screen?") → [SILENT]
-
-# DECISION FLOWCHART
-```
-Message received → Contains "Gemini"? → YES → RESPOND
-                                      → NO  → Is my last response recent AND this is a related follow-up? → YES → RESPOND
-                                                                                                           → NO  → [SILENT]
-```
-
-# RESPONSE RULES
-
-1. **VOICE-FIRST**: Keep ALL responses to 1-2 short sentences. Users are LISTENING.
-
-2. **NATURAL TONE**: Speak like a helpful friend. Say "I can help" NOT "The assistant can help".
-
-3. **MULTILINGUAL**: Respond in the same language the user speaks.
-
-4. **INTERRUPTIONS**: If you see "[interrupted]" in your last response, the user cut you off. Respond to the NEW message naturally. Don't acknowledge the interruption. Fragments after interruption like "stop", "wait" → [SILENT].
-
-# TOOL USAGE
-- web_search: Real-time info (weather, news, prices, current events)
-- rag_search: Internal knowledge base queries
-
-When searching, say a SHORT filler like "One moment" then call the tool. Never write function calls as text.
-
-# EXAMPLES
-
-User: "Hello everyone, let's start the meeting"
-→ [SILENT] (not addressed to you)
-
-User: "Gemini, what's the weather?"
-→ "It's 28 degrees and partly cloudy." (wake word present)
-
-User: "What about tomorrow?"
-→ "Tomorrow will be slightly cooler at 25 degrees." (follow-up to weather)
-
-User: "Thanks. Hey Rahul, can you share your screen?"
-→ [SILENT] (talking to Rahul, not you)
-
-User: "So as I was saying about the project..."
-→ [SILENT] (general meeting conversation)'''
+## EXAMPLES
+User: "Hello everyone, let's begin" → [SILENT]
+User: "Gemini, what's the weather?" → "It's 28 degrees and partly cloudy."
+User: "What about tomorrow?" → "Tomorrow will be around 25 degrees."  
+User: "Thanks. Hey Rahul, can you share?" → [SILENT]
+User: "So about the project budget..." → [SILENT]'''
 
 
 class LLMClient:
     """
-    OpenRouter LLM client with streaming and function calling.
+    Groq LLM client with streaming and function calling.
     
-    Uses persistent HTTP/2 connection for low latency.
+    Uses persistent HTTP/2 connection for ultra-low latency on Groq's LPU.
     """
     
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "meta-llama/llama-4-maverick",
+        model: str = "llama-3.3-70b-versatile",
         max_tokens: int = 256,
         temperature: float = 0.7,
     ):
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.api_key = api_key or os.getenv("GROQ_API_KEY")
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -144,15 +105,13 @@ class LLMClient:
         self._tool_handlers: Dict[str, Callable] = {}
         
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create persistent HTTP/2 client."""
+        """Get or create persistent HTTP/2 client for Groq."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                base_url="https://openrouter.ai/api/v1",
+                base_url="https://api.groq.com/openai/v1",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://voice-ai.local",
-                    "X-Title": "Voice AI Assistant",
                 },
                 http2=True,
                 timeout=httpx.Timeout(60.0, connect=10.0),
@@ -166,10 +125,10 @@ class LLMClient:
 
     async def warmup(self):
         """
-        Warm up the HTTP/2 connection to OpenRouter.
+        Warm up the HTTP/2 connection to Groq.
 
         Establishes TCP + TLS + HTTP/2 negotiation upfront so the first
-        real LLM request doesn't pay the 2-3 second connection overhead.
+        real LLM request doesn't pay connection overhead.
         """
         try:
             start_time = time.time()

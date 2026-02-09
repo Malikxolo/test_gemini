@@ -14,6 +14,7 @@ import sys
 import asyncio
 import logging
 import pathlib
+import time
 from typing import Optional
 
 # Add parent to path for imports
@@ -69,6 +70,10 @@ class VoiceAI:
         self._generation_id: int = 0
         self._current_task: Optional[asyncio.Task] = None
         
+        # Timing metrics (for response latency tracking)
+        self._t_utterance_end: Optional[float] = None
+        self._t_first_llm_chunk: Optional[float] = None
+        
         # Register tool handlers
         self.llm.register_tool("web_search", web_search)
         self.llm.register_tool("rag_search", rag_search)
@@ -81,8 +86,8 @@ class VoiceAI:
         if not os.getenv("DEEPGRAM_API_KEY"):
             logger.error("❌ DEEPGRAM_API_KEY not set in .env")
             return False
-        if not os.getenv("OPENROUTER_API_KEY"):
-            logger.error("❌ OPENROUTER_API_KEY not set in .env")
+        if not os.getenv("GROQ_API_KEY"):
+            logger.error("❌ GROQ_API_KEY not set in .env")
             return False
 
         # Start audio I/O
@@ -153,7 +158,7 @@ class VoiceAI:
                 await asyncio.sleep(0.1)
 
     async def _llm_keep_alive_loop(self):
-        """Periodically ping OpenRouter to keep the HTTP/2 connection alive."""
+        """Periodically ping Groq to keep the HTTP/2 connection alive."""
         while self._running:
             await asyncio.sleep(45)
             try:
@@ -190,7 +195,12 @@ class VoiceAI:
     def _on_transcript(self, transcript: str, is_final: bool):
         """Handle STT transcript updates."""
         if is_final:
-            self._current_transcript = transcript
+            # ACCUMULATE transcripts (don't overwrite!)
+            # Deepgram may send multiple is_final=True results for long speech
+            if self._current_transcript:
+                self._current_transcript += " " + transcript
+            else:
+                self._current_transcript = transcript
             logger.info(f"🗣️ User: {transcript}")
         else:
             # Show interim results
@@ -206,6 +216,10 @@ class VoiceAI:
         """Handle end of user utterance - trigger LLM processing."""
         if not self._current_transcript:
             return
+
+        # Record timing: user stopped speaking, transcription ready
+        self._t_utterance_end = time.perf_counter()
+        self._t_first_llm_chunk = None  # Reset for new utterance
 
         transcript = self._current_transcript
         self._current_transcript = ""
@@ -244,6 +258,10 @@ class VoiceAI:
                 if chunk["type"] == "text":
                     text = chunk["content"]
                     full_response += text
+
+                    # Record timing: first LLM chunk received
+                    if self._t_first_llm_chunk is None and self._t_utterance_end is not None:
+                        self._t_first_llm_chunk = time.perf_counter()
 
                     # Check for SILENT marker
                     if self.SILENT_MARKER in full_response:
@@ -344,14 +362,34 @@ class VoiceAI:
         logger.debug(f"🔊 Speaking: {text}")
 
         try:
+            first_chunk = True
             async for audio_chunk in self.tts.synthesize(text):
                 if gen_id != self._generation_id:
                     return  # Interrupted during TTS streaming
+                
+                # Record timing when FIRST audio chunk arrives (TTS actually started)
+                if first_chunk:
+                    t_tts_start = time.perf_counter()
+                    
+                    # Calculate and log timing metrics
+                    if self._t_utterance_end is not None and self._t_first_llm_chunk is not None:
+                        llm_ttfc = (self._t_first_llm_chunk - self._t_utterance_end) * 1000  # ms
+                        tts_start_latency = (t_tts_start - self._t_first_llm_chunk) * 1000  # ms
+                        total_latency = (t_tts_start - self._t_utterance_end) * 1000  # ms
+                        
+                        logger.info(
+                            f"⏱️  LATENCY | LLM TTFC: {llm_ttfc:.0f}ms | "
+                            f"TTS Start: {tts_start_latency:.0f}ms | "
+                            f"Total: {total_latency:.0f}ms"
+                        )
+                    first_chunk = False
+                
                 self.audio_out.play(audio_chunk)
         except asyncio.CancelledError:
             raise  # Propagate to _process_utterance handler
         except Exception as e:
             logger.error(f"TTS error: {e}")
+
 
 
 async def main():
